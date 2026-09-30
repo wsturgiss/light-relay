@@ -1,0 +1,33 @@
+# Reference only: the pair on a host running its own tailscaled, not Unraid's
+# per-container Tailscale. Ports are bound to loopback; publish them with
+#   tailscale serve  --bg --https=443  http://127.0.0.1:8080   # relay, tailnet only
+#   tailscale funnel --bg --https=8443 http://127.0.0.1:8081   # inbox, public
+# Docker's port proxy makes the peer the bridge gateway, not loopback, so it is
+# listed in TRUSTED_PROXIES (check yours: docker network inspect bridge).
+services:
+  relay:
+    build: .
+    environment:
+      ROLE: relay
+      ALLOWED_PEERS: ${ALLOWED_PEERS}
+      PUSH_ENDPOINT: ${PUSH_ENDPOINT}
+      PUSH_KEY: ${PUSH_KEY}
+      TRUSTED_PROXIES: 127.0.0.1,::1,172.17.0.1
+    volumes:
+      - ./data/relay:/data
+      - ./data/inbox:/inbox:ro
+    ports:
+      - 127.0.0.1:8080:8080
+    restart: unless-stopped
+
+  inbox:
+    build: .
+    environment:
+      ROLE: inbox
+      REPLY_TOKEN: ${REPLY_TOKEN}
+      TRUSTED_PROXIES: 127.0.0.1,::1,172.17.0.1
+    volumes:
+      - ./data/inbox:/data
+    ports:
+      - 127.0.0.1:8081:8081
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+.git
+tests
+docs
+agent
+data
+__pycache__

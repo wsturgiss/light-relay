@@ -139,6 +139,24 @@ address. The relay then checks that address against `ALLOWED_PEERS`, so no
 credential lives on the agent's side. Narrow it further with a tailnet access rule
 (grant) that lets only the agent and your own devices reach the `relay` node.
 
+## Run it on any Docker host
+
+`scripts/up.sh [state dir]` builds the image and (re)starts both containers on
+the host network, bound to `127.0.0.1` (relay on 18080, inbox on 18081). Settings
+go in `<state dir>/relay.env` and `inbox.env`, which are created on the first run
+and never overwritten. The default state dir is `~/.local/share/light-relay`.
+Then publish:
+
+```bash
+tailscale serve  --bg --https=443  http://127.0.0.1:18080   # relay: tailnet only
+tailscale funnel --bg --https=8443 http://127.0.0.1:18081   # inbox: public
+```
+
+This is how it runs on `baconstation` today: the relay is at
+`https://baconstation.tailda71f7.ts.net` and the inbox at
+`https://baconstation.tailda71f7.ts.net:8443/replies`. After editing an `.env` file,
+re-run `up.sh`. `scripts/deploy-unraid.sh root@<box>` does the same on Unraid over SSH.
+
 ## Install on Unraid
 
 Tailscale is already on the box. This uses Unraid 7's per-container Tailscale, so

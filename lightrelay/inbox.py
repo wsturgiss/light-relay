@@ -18,8 +18,8 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from .common import (HttpError, Handler, RateLimiter, env, env_int, log,
-                     parse_ips, serve, setup_logging)
+from .common import (REPLY_COLUMNS, HttpError, Handler, RateLimiter, env, env_int,
+                     log, parse_ips, reply_from_row, serve, setup_logging)
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_TEXT = 1000
@@ -27,6 +27,9 @@ MAX_CHOICE = 64
 RETAIN_DAYS = 90
 MAX_ROWS = 5000
 MAX_FETCH = 100
+MAX_TITLE = 120
+# A conversation started on the phone. The agent continues it with notify's `thread`.
+THREAD_RE = re.compile(r"^t_[0-9a-f]{16}$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS replies (
@@ -53,16 +56,22 @@ class ReplyStore:
         self.db.execute("PRAGMA journal_mode=DELETE")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        # Added with conversations started on the phone; older databases lack them.
+        have = {row[1] for row in self.db.execute("PRAGMA table_info(replies)")}
+        for column in ("thread", "title"):
+            if column not in have:
+                self.db.execute(f"ALTER TABLE replies ADD COLUMN {column} TEXT")
         self.lock = threading.Lock()
 
     def add(self, reply):
         """Store a reply. Returns False if its id was already stored (a retry)."""
         with self.lock:
             cur = self.db.execute(
-                "INSERT OR IGNORE INTO replies (id, message_id, choice, text, sent_at, received_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (reply["id"], reply.get("messageId"), reply.get("choice"),
-                 reply.get("text"), reply.get("sentAt"), now_iso()),
+                "INSERT OR IGNORE INTO replies"
+                " (id, message_id, thread, title, choice, text, sent_at, received_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (reply["id"], reply.get("messageId"), reply.get("thread"), reply.get("title"),
+                 reply.get("choice"), reply.get("text"), reply.get("sentAt"), now_iso()),
             )
             self._prune()
             return cur.rowcount == 1
@@ -70,10 +79,9 @@ class ReplyStore:
     def since(self, after, limit):
         with self.lock:
             rows = self.db.execute(
-                "SELECT seq, id, message_id, choice, text, sent_at, received_at FROM replies"
-                " WHERE seq > ? ORDER BY seq LIMIT ?", (after, limit)).fetchall()
-        return [{"seq": r[0], "id": r[1], "messageId": r[2], "choice": r[3],
-                 "text": r[4], "sentAt": r[5], "receivedAt": r[6]} for r in rows]
+                f"SELECT {REPLY_COLUMNS} FROM replies WHERE seq > ? ORDER BY seq LIMIT ?",
+                (after, limit)).fetchall()
+        return [reply_from_row(r) for r in rows]
 
     def _prune(self):
         cutoff = datetime.fromtimestamp(time.time() - RETAIN_DAYS * 86400, timezone.utc)
@@ -101,8 +109,16 @@ def validate(data):
     sent_at = data.get("sentAt")
     if sent_at is not None and (not isinstance(sent_at, str) or len(sent_at) > 40):
         raise HttpError(400, "bad sentAt")
-    return {"id": reply_id, "messageId": message_id, "choice": choice or None,
-            "text": text or None, "sentAt": sent_at}
+    thread = data.get("thread")
+    if thread is not None and (not isinstance(thread, str) or not THREAD_RE.match(thread)):
+        raise HttpError(400, "thread must be t_ and 16 hex digits")
+    title = data.get("title")
+    if title is not None and (not isinstance(title, str) or len(title) > MAX_TITLE):
+        raise HttpError(400, f"title must be a string of at most {MAX_TITLE} chars")
+    if title and not thread:
+        raise HttpError(400, "a title starts a conversation, so it needs a thread")
+    return {"id": reply_id, "messageId": message_id, "thread": thread, "title": title or None,
+            "choice": choice or None, "text": text or None, "sentAt": sent_at}
 
 
 def read_messages(db_path, after, limit):

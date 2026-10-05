@@ -181,6 +181,25 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(json.loads(payload)["headline"], "before new keys")
         self.assertEqual(relay.RelayHandler.outbox.resign(new_key), 0)
 
+    def test_a_follow_up_joins_the_first_messages_thread(self):
+        first = self.notify("Muse tailnet test")
+        self.assertEqual(first["thread"], first["id"])
+        second = request(self.relay_url + "/notify", "POST",
+                         {"headline": "Got your Got it", "thread": first["id"]}, via=AGENT_IP)[1]
+        # Naming the second message still lands in the first one's thread.
+        third = request(self.relay_url + "/notify", "POST",
+                        {"headline": "And again", "thread": second["id"]}, via=AGENT_IP)[1]
+        self.assertEqual((second["thread"], third["thread"]), (first["id"], first["id"]))
+        pushed = [json.loads(b.decode().split(".", 2)[2]) for b in FakePush.received]
+        self.assertEqual([m.get("thread") for m in pushed], [None, first["id"], first["id"]])
+
+    def test_unknown_thread_starts_its_own(self):
+        status, body = request(self.relay_url + "/notify", "POST",
+                               {"headline": "hi", "thread": "m_00000000000000ff"}, via=AGENT_IP)
+        self.assertEqual((status, body["thread"]), (202, "m_00000000000000ff"))
+        self.assertEqual(request(self.relay_url + "/notify", "POST",
+                                 {"headline": "hi", "thread": "not-an-id"}, via=AGENT_IP)[0], 400)
+
     def test_unpaired_relay_answers_503(self):
         relay.RelayHandler.push_key = None
         status, _ = request(self.relay_url + "/notify", "POST", {"headline": "hi"}, via=AGENT_IP)
@@ -222,6 +241,40 @@ class EndToEnd(unittest.TestCase):
         last = body["replies"][-1]["seq"]
         self.assertEqual(request(self.relay_url + "/replies/ack", "POST", {"upTo": last}, via=AGENT_IP)[0], 200)
         self.assertEqual(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"], [])
+
+    def test_conversation_started_on_the_phone_reaches_the_agent_and_back(self):
+        start = {"id": "r_start", "thread": "t_0123456789abcdef", "title": "Plan Saturday",
+                 "text": "Plan Saturday\nHike or the market?"}
+        self.assertEqual(self.reply(start)[0], 202)
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
+        self.assertEqual((got["thread"], got["title"], got["messageId"]),
+                         ("t_0123456789abcdef", "Plan Saturday", None))
+        answer = request(self.relay_url + "/notify", "POST",
+                         {"headline": "Hike", "thread": got["thread"]}, via=AGENT_IP)[1]
+        self.assertEqual(answer["thread"], "t_0123456789abcdef")
+        # The phone can read its own start back to rebuild the conversation.
+        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["title"], "Plan Saturday")
+
+    def test_bad_thread_or_title_is_rejected(self):
+        for body in ({"id": "r1", "text": "x", "thread": "m_0123456789abcdef"},
+                     {"id": "r1", "text": "x", "title": "no thread"},
+                     {"id": "r1", "text": "x", "thread": "t_0123456789abcdef", "title": "x" * 121}):
+            self.assertEqual(self.reply(body)[0], 400, body)
+
+    def test_older_reply_database_gains_the_new_columns(self):
+        path = f"{self.tmp.name}/old.db"
+        import sqlite3
+        old = sqlite3.connect(path)
+        old.execute("CREATE TABLE replies (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,"
+                    " message_id TEXT, choice TEXT, text TEXT, sent_at TEXT, received_at TEXT NOT NULL)")
+        old.execute("INSERT INTO replies (id, choice, received_at) VALUES ('r_old', 'Yes', '2099-01-01T00:00:00Z')")
+        old.commit()
+        old.close()
+        store = inbox.ReplyStore(path)
+        try:
+            self.assertEqual(store.since(0, 10)[0]["thread"], None)
+        finally:
+            store.db.close()
 
     def test_retried_reply_is_stored_once(self):
         self.reply({"id": "r1", "text": "hello"})

@@ -24,14 +24,16 @@ import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from .common import (HttpError, Handler, RateLimiter, env, env_int, log,
-                     parse_ips, serve, setup_logging)
+from .common import (REPLY_COLUMNS, HttpError, Handler, RateLimiter, env, env_int,
+                     log, parse_ips, reply_from_row, serve, setup_logging)
 
 MAX_HEADLINE = 120
 MAX_DETAIL = 1000
 MAX_CHOICES = 4
 MAX_CHOICE = 24
 REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+# A message the relay sent (m_), or a conversation started on the phone (t_).
+THREAD_ID_RE = re.compile(r"^[mt]_[0-9a-f]{16}$")
 RETAIN_DAYS = 90
 MAX_ROWS = 5000
 
@@ -68,9 +70,10 @@ def parse_message(content_type, body):
         detail = data.get("detail", "")
         choices = data.get("choices", [])
         ref = data.get("ref")
+        thread = data.get("thread")
     else:
         headline, _, detail = raw.strip().partition("\n")
-        choices, ref = [], None
+        choices, ref, thread = [], None, None
 
     if not isinstance(headline, str) or not headline.strip():
         raise HttpError(400, "headline is required")
@@ -87,6 +90,8 @@ def parse_message(content_type, body):
         raise HttpError(400, f"choices must be up to {MAX_CHOICES} strings of at most {MAX_CHOICE} chars")
     if ref is not None and (not isinstance(ref, str) or not REF_RE.match(ref)):
         raise HttpError(400, "ref must be 1-64 of [A-Za-z0-9_.:-]")
+    if thread is not None and (not isinstance(thread, str) or not THREAD_ID_RE.match(thread)):
+        raise HttpError(400, "thread must be a message id (m_…) or a reply's thread (t_…)")
 
     message = {
         "v": 1,
@@ -98,6 +103,8 @@ def parse_message(content_type, body):
     }
     if ref:
         message["ref"] = ref
+    if thread:
+        message["thread"] = thread
     return message
 
 
@@ -134,6 +141,14 @@ class Outbox:
             self.db.execute("INSERT INTO messages (id, at, payload, body) VALUES (?, ?, ?, ?)",
                             (message["id"], message["at"], payload, body.decode()))
             self._prune()
+
+    def thread_of(self, message_id):
+        """The conversation `message_id` belongs to: the id of its first message.
+        An id the outbox doesn't know (pruned, or from before the outbox) starts
+        its own conversation."""
+        with self.lock:
+            row = self.db.execute("SELECT payload FROM messages WHERE id = ?", (message_id,)).fetchone()
+        return json.loads(row[0]).get("thread", message_id) if row else message_id
 
     def resign(self, key):
         """Sign everything kept under `key`. New keys on the phone (or a reinstall)
@@ -186,17 +201,15 @@ def read_replies(db_path, after, limit):
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         db.execute("PRAGMA busy_timeout=5000")
-        rows = db.execute(
-            "SELECT seq, id, message_id, choice, text, sent_at, received_at FROM replies"
-            " WHERE seq > ? ORDER BY seq LIMIT ?", (after, limit)).fetchall()
+        rows = db.execute(f"SELECT {REPLY_COLUMNS} FROM replies WHERE seq > ? ORDER BY seq LIMIT ?",
+                          (after, limit)).fetchall()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
             return []
         raise
     finally:
         db.close()
-    return [{"seq": r[0], "id": r[1], "messageId": r[2], "choice": r[3],
-             "text": r[4], "sentAt": r[5], "receivedAt": r[6]} for r in rows]
+    return [reply_from_row(r) for r in rows]
 
 
 class RelayHandler(Handler):
@@ -233,12 +246,16 @@ class RelayHandler(Handler):
         message = parse_message(self.headers.get("Content-Type", "text/plain"), self.read_body())
         if not self.notify_limit.allow("notify"):
             raise HttpError(429, "notify rate limit reached")
+        if "thread" in message:
+            # The agent may name any message in the conversation; the phone groups by the first.
+            message["thread"] = self.outbox.thread_of(message["thread"])
 
         body = sign(message, self.push_key)
         self.outbox.add(message, body)
         pushed = self.push(message, body) if self.push_endpoint else False
         log.info("stored %s (%s)", message["id"], "pushed" if pushed else "waiting to be fetched")
-        self.send_json(202, {"id": message["id"], "at": message["at"], "pushed": pushed})
+        self.send_json(202, {"id": message["id"], "at": message["at"],
+                             "thread": message.get("thread", message["id"]), "pushed": pushed})
 
     def push(self, message, body):
         """Best effort: a message that doesn't push still waits in the outbox,

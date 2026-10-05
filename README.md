@@ -12,24 +12,25 @@ from the blueprint, it says so under **Differences from the blueprint** below.
 ```
                  tailnet only (Serve)                        Light's push server
  agent ("muse") ────POST /notify────▶  relay  ──signed push──▶  (UnifiedPush)  ──▶  LP3: Relay Inbox
-      ▲                                  │  ▲                                              │
-      └────GET /replies, POST /ack───────┘  │ reads inbox.db (read-only mount)             │
-                                            │                                              │
-                                          inbox  ◀──────POST /replies (bearer)─────────────┘
-                                  public, write-only (Funnel)
+      ▲                                  │  ▲   (if paired for push)                       │  ▲
+      └────GET /replies, POST /ack───────┘  │                                              │  │
+                          outbox.db (ro) ▼  │ inbox.db (ro)                                │  │
+                                          inbox  ◀──────POST /replies (bearer)─────────────┘  │
+                                   public (Funnel) ──────GET /messages, /replies (bearer)─────┘
 ```
 
 Two containers from one image:
 
 | Container | `ROLE` | Published with | Who can reach it | What it does |
 |---|---|---|---|---|
-| **relay** | `relay` | Tailscale **Serve** | tailnet devices listed in `ALLOWED_PEERS` | `/notify` → push to the phone; `/replies` → hand replies to the agent |
-| **inbox** | `inbox` | Tailscale **Funnel** | the internet, with the reply token | `POST /replies` and nothing else |
+| **relay** | `relay` | Tailscale **Serve** | tailnet devices listed in `ALLOWED_PEERS` | `/notify` → outbox, and a push to the phone if it has an endpoint; `/replies` → hand replies to the agent |
+| **inbox** | `inbox` | Tailscale **Funnel** | the internet, with the reply token | the tool's side: post replies, fetch messages, read back the conversation |
 
-The inbox is the only public surface. It can't read anything, can't push to the
-phone, and has no route into the tailnet. The relay reads the inbox's database
-through a read-only mount, so the agent collects replies over the tailnet from
-the same host it sends to.
+The inbox is the only public surface. It can't push to the phone, can't delete
+anything, and has no route into the tailnet. Each container reads the other's database through a read-only mount:
+the relay reads replies for the agent, and the inbox reads the outbox for the
+tool. The tool fetches messages whether or not push works, and pushes, when
+they arrive, are just the same messages sooner.
 
 Standard library Python only, with no dependencies. `python -m unittest` runs the tests.
 
@@ -57,9 +58,13 @@ Or JSON, which can carry choices:
 | `choices` | ≤ 4, each ≤ 24 chars |
 | `ref` | optional, `[A-Za-z0-9_.:-]{1,64}` |
 
-Replies: `202 {"id": "m_…", "at": "…"}` once the push server accepted it · `400` bad
-message · `403` not an allowed device · `429` over `NOTIFY_RATE_PER_HOUR` · `502` the
-push server refused or was unreachable (safe to retry) · `503` not paired yet.
+Replies: `202 {"id": "m_…", "at": "…", "pushed": true}` once it's in the outbox ·
+`400` bad message · `403` not an allowed device · `429` over `NOTIFY_RATE_PER_HOUR` ·
+`503` not paired yet (no `PUSH_KEY`).
+
+`pushed` is false when there's no `PUSH_ENDPOINT` or the push server refused it (the
+relay logs why). Either way the message is stored and the tool fetches it, so don't
+resend: that would put it on the phone twice.
 
 ### Relay → phone: the push
 
@@ -67,6 +72,20 @@ One POST to the tool's UnifiedPush endpoint, body
 `v1.<hex HMAC-SHA256(PUSH_KEY, json)>.<json>`, where the JSON is
 `{"v":1,"id","at","headline","detail","choices"[,"ref"]}`. The tool drops anything
 that doesn't verify, so knowing the endpoint URL isn't enough to put text on the phone.
+
+### Phone ← inbox: `GET /messages`, `GET /replies`
+
+Both take `Authorization: Bearer <REPLY_TOKEN>` and `?after=<seq>&limit=<n≤100>`, and
+return rows oldest first. The tool keeps its own place; reads change nothing on the box.
+
+`GET /messages` → `{"messages": [{"seq": 4, "body": "v1.<mac>.<json>"}]}`. `body` is
+byte-for-byte what was (or would have been) pushed, so the tool checks it the same way.
+
+`GET /replies` → `{"replies": [{"seq", "id", "messageId", "choice", "text", "sentAt",
+"receivedAt"}]}`: the tool's own replies, so it can rebuild the conversation after a
+reinstall. Reading them doesn't move the agent's cursor.
+
+Both are kept for 90 days (at most 5000 rows each).
 
 ### Phone → inbox: `POST /replies`
 
@@ -104,6 +123,93 @@ relayctl.py replies --ack
 
 The agent's scheduled check is `relayctl.py replies`: act on each reply, then `relayctl.py ack <last seq>`.
 
+## Connecting an agent
+
+An agent is anything that can make an HTTPS request from a tailnet device: a script,
+a cron job, or an LLM agent with a shell tool. It holds no secrets. The relay knows it
+by its tailnet address.
+
+### 1. Let its device in
+
+1. Put the agent's machine on the tailnet. A client-only device is enough.
+2. Add its tailnet IP (`tailscale ip -4 <device>`) to `ALLOWED_PEERS` in `relay.env`.
+   The value is comma-separated.
+3. Re-run `scripts/up.sh`.
+4. From the agent's machine, check that it can reach the relay:
+
+   ```bash
+   curl https://baconstation.tailda71f7.ts.net/healthz   # {"ok": true, "paired": true, ...}
+   ```
+
+   If this check passes but `/notify` answers 403, the IP isn't in `ALLOWED_PEERS`.
+   The relay logs `refused POST /notify from <ip>` with the address it saw.
+
+### 2. Give it the client
+
+Copy [`agent/relayctl.py`](agent/relayctl.py) onto the machine. It's one file with no
+dependencies beyond Python 3. Then point it at the relay:
+
+```bash
+export RELAY_URL=https://baconstation.tailda71f7.ts.net
+```
+
+### 3. Send
+
+```bash
+relayctl.py notify "Book the 9:40?" "Holds expire at noon." --choice Yes --choice No
+# {"id": "m_691c2570d10b8b8a", "at": "2026-10-05T04:21:02Z", "pushed": true}
+```
+
+- Keep the `id`. Replies come back with it as `messageId`.
+- Use `--choice` when you want a decision: up to four choices, each up to 24 characters.
+  The phone shows them as tappable rows. Without choices, the user can still type a reply.
+- **Don't resend** when `pushed` is false. The message is already stored, and the phone
+  fetches it within 15 minutes or as soon as the tool is opened. A resend shows up twice.
+- Keep it short. See [Messages](#messages).
+
+### 4. Collect replies
+
+Check for replies on a schedule, act on each one, then acknowledge it:
+
+```bash
+relayctl.py replies          # JSON list: seq, id, messageId, choice, text, sentAt, receivedAt
+relayctl.py ack <last seq>   # only after acting on it
+```
+
+Each reply carries a `choice` (one of the choices you sent) or free `text`, sometimes
+both. Acknowledge only what you've acted on. Anything not yet acknowledged comes back on
+the next check, so a crash in between can't lose a reply. A plain cron job works:
+
+```cron
+*/5 * * * *  RELAY_URL=https://baconstation.tailda71f7.ts.net /path/to/check-replies.sh
+```
+
+### For an LLM agent
+
+Give it shell access with `RELAY_URL` set, and an instruction like this in its system
+prompt, `AGENTS.md` or `CLAUDE.md`:
+
+> You can reach Will on his Light Phone through `relayctl.py`.
+> - `relayctl.py notify "<headline>" "<detail>" [--choice A --choice B]` sends a message.
+>   Keep the headline under 120 characters and the detail to two or three plain sentences.
+>   Offer choices when you need a decision. Note the returned `id`.
+> - `relayctl.py replies` lists answers that haven't been handled yet. Match each one to
+>   your message by `messageId`, act on it, then run `relayctl.py ack <seq>`.
+> - Use it for things worth interrupting him for, at most a few times a day.
+>   Never resend a message to check that it arrived.
+
+### Without Python
+
+The client is a thin wrapper over three calls:
+
+```bash
+R=https://baconstation.tailda71f7.ts.net
+curl -X POST $R/notify -H 'Content-Type: application/json' \
+  -d '{"headline": "Book the 9:40?", "detail": "Holds expire at noon.", "choices": ["Yes", "No"]}'
+curl $R/replies
+curl -X POST $R/replies/ack -H 'Content-Type: application/json' -d '{"upTo": 6}'
+```
+
 ## Settings
 
 **relay**
@@ -111,10 +217,11 @@ The agent's scheduled check is `relayctl.py replies`: act on each reply, then `r
 | Variable | Default | |
 |---|---|---|
 | `ALLOWED_PEERS` | *(required)* | Tailnet IPs allowed to call it, comma-separated: the agent's device, plus your laptop for testing. `tailscale ip -4 muse` |
-| `PUSH_ENDPOINT` | | From the tool's Pairing screen |
+| `PUSH_ENDPOINT` | | From the tool's Pairing screen, if LightOS issued one. Without it, messages are only fetched |
 | `PUSH_KEY` | | From the tool's Pairing screen |
 | `NOTIFY_RATE_PER_HOUR` | `60` | Caps a runaway agent |
 | `INBOX_DB` | `/inbox/inbox.db` | The inbox's database, mounted read-only |
+| `OUTBOX_DB` | `/data/outbox.db` | Signed messages for the tool to fetch |
 | `PORT` | `8080` | |
 
 **inbox**
@@ -125,6 +232,7 @@ The agent's scheduled check is `relayctl.py replies`: act on each reply, then `r
 | `INBOX_RATE_PER_MIN` | `20` | Per client IP, rejected requests included |
 | `INBOX_RATE_TOTAL_PER_MIN` | `120` | Across all clients |
 | `INBOX_MAX_BODY` | `4096` | Bytes |
+| `OUTBOX_DB` | `/outbox/outbox.db` | The relay's outbox, mounted read-only |
 | `PORT` | `8081` | |
 
 **Both:** `DATA_DIR` (`/data`), `TRUSTED_PROXIES` (`127.0.0.1,::1`), `CLIENT_IP_HEADER`
@@ -172,7 +280,8 @@ even to the LAN.
    three values (see the tool's README for ways to get them off the phone).
 4. **inbox container.** Add Container → the image, and set:
    - Variables: `ROLE=inbox`, `REPLY_TOKEN=…`
-   - Path: `/data` → `/mnt/user/appdata/light-relay/inbox`
+   - Paths: `/data` → `/mnt/user/appdata/light-relay/inbox`, and
+     `/outbox` → `/mnt/user/appdata/light-relay/relay` **read-only**
    - Advanced → **Use Tailscale**: on, hostname `relay-inbox`, **Serve: Funnel**, port `8081`
    - **Funnel must be allowed on the tailnet once:** admin console → Access controls → the `funnel` node attribute.
    - The public address is `https://relay-inbox.<tailnet>.ts.net/replies`. Build it into the
@@ -214,13 +323,16 @@ These can't be settled from here:
 - Stop the **relay** container: no pushes, no replies handed out.
 - Stop the **inbox** container, or turn Funnel off for `relay-inbox`: the public surface is gone.
 - Tap **New keys** in the tool: the old push key and reply token stop working
-  as soon as the box has the new ones.
+  as soon as the box has the new ones. When the relay restarts with a new `PUSH_KEY`
+  it re-signs the messages it keeps, so the tool's history carries over.
 
 ## Blast radius
 
 Someone who has the push endpoint but not the push key can't get a message
 shown; the tool drops it. Someone who has the reply token can put fake replies in
-front of the agent, but can't read anything or reach the tailnet. Without the
+front of the agent and read the last 90 days of the conversation, but can't put a
+message on the phone (that takes the push key, which the inbox never has) or reach
+the tailnet. Without the
 token, the inbox answers 401 before reading the body, and rate limits cap how hard
 anyone can hammer it. Tailscale gives Funnel no DDoS protection.
 
@@ -230,10 +342,11 @@ anyone can hammer it. Tailscale gives Funnel no DDoS protection.
   to hold it to check signatures, and typing 43 characters into a Light Phone is
   worse than copying them off one. It still never goes to the agent. The reply token
   was already phone-generated in the blueprint.
-- **The agent reads replies from the relay, not from the inbox.** The inbox
-  container has exactly one port, the public write-only one, and nothing on it is
-  readable, even from the tailnet. The relay reads the inbox's database through a
-  read-only mount.
+- **The agent reads replies from the relay, not from the inbox.** The relay reads
+  the inbox's database through a read-only mount.
+- **The inbox isn't write-only.** The tool can fetch messages and read back the
+  conversation through it, with the reply token. That makes push optional (LightOS
+  may not give a sideloaded tool an endpoint) and lets the tool rebuild its history.
 - **Device authentication is an IP allowlist** of tailnet addresses, taken from the
   header Serve adds (see above). It is paired with a tailnet access rule.
 

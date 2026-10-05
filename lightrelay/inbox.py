@@ -1,17 +1,22 @@
 """The reply inbox: the one public door, published with Tailscale Funnel.
 
-It accepts replies from the Relay Inbox tool and does nothing else. There is no
-way to list, read or delete anything through it, and it has no route to the
-phone-pushing path. The relay reads the database it writes, through a
-read-only mount in its own container.
+Everything on it is for the Relay Inbox tool and behind the reply token: it
+accepts replies (POST /replies), and it hands back the conversation so far
+(GET /messages: the relay's signed messages, GET /replies: the replies stored
+here), so the tool can fetch messages without a push endpoint and rebuild its
+history. Nothing can be deleted through it, and it has no route to the
+phone-pushing path. It reads the relay's outbox through a read-only mount,
+and the relay reads the reply database it writes the same way.
 """
 
 import hmac
+import os
 import re
 import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 from .common import (HttpError, Handler, RateLimiter, env, env_int, log,
                      parse_ips, serve, setup_logging)
@@ -19,8 +24,9 @@ from .common import (HttpError, Handler, RateLimiter, env, env_int, log,
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_TEXT = 1000
 MAX_CHOICE = 64
-RETAIN_DAYS = 30
-MAX_ROWS = 1000
+RETAIN_DAYS = 90
+MAX_ROWS = 5000
+MAX_FETCH = 100
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS replies (
@@ -61,6 +67,14 @@ class ReplyStore:
             self._prune()
             return cur.rowcount == 1
 
+    def since(self, after, limit):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT seq, id, message_id, choice, text, sent_at, received_at FROM replies"
+                " WHERE seq > ? ORDER BY seq LIMIT ?", (after, limit)).fetchall()
+        return [{"seq": r[0], "id": r[1], "messageId": r[2], "choice": r[3],
+                 "text": r[4], "sentAt": r[5], "receivedAt": r[6]} for r in rows]
+
     def _prune(self):
         cutoff = datetime.fromtimestamp(time.time() - RETAIN_DAYS * 86400, timezone.utc)
         self.db.execute("DELETE FROM replies WHERE received_at < ?",
@@ -91,8 +105,37 @@ def validate(data):
             "text": text or None, "sentAt": sent_at}
 
 
+def read_messages(db_path, after, limit):
+    """Signed messages from the relay's outbox, oldest first."""
+    if not os.path.exists(db_path):
+        return []
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA busy_timeout=5000")
+        rows = db.execute("SELECT seq, body FROM messages WHERE seq > ? ORDER BY seq LIMIT ?",
+                          (after, limit)).fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return []
+        raise
+    finally:
+        db.close()
+    return [{"seq": r[0], "body": r[1]} for r in rows]
+
+
+def paging(query):
+    """`after` is the last seq the tool already has; the tool keeps its own place."""
+    try:
+        after = max(int(query.get("after", ["0"])[0]), 0)
+        limit = min(max(int(query.get("limit", ["50"])[0]), 1), MAX_FETCH)
+    except ValueError:
+        raise HttpError(400, "after and limit must be integers")
+    return after, limit
+
+
 class InboxHandler(Handler):
     store = None
+    outbox_db = None
     token = b""
     per_ip = None
     overall = None
@@ -102,16 +145,38 @@ class InboxHandler(Handler):
         # Everything counts against the sender, junk included.
         if not self.per_ip.allow(ip) or not self.overall.allow("all"):
             raise HttpError(429, "slow down")
-        if method != "POST" or self.path != "/replies":
+        url = urlsplit(self.path)
+        if (method, url.path) == ("POST", "/replies"):
+            handler = self.post_reply
+        elif (method, url.path) == ("GET", "/messages"):
+            handler = self.get_messages
+        elif (method, url.path) == ("GET", "/replies"):
+            handler = self.get_replies
+        else:
             raise HttpError(404, "not found")
         # Reject before reading a byte of the body.
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:].strip().encode(), self.token):
             raise HttpError(401, "unauthorized")
+        handler(ip, parse_qs(url.query))
+
+    def post_reply(self, ip, _query):
         reply = validate(self.read_json())
         stored = self.store.add(reply)
         log.info("reply %s from %s (%s)", reply["id"], ip, "stored" if stored else "duplicate")
         self.send_json(202, {"ok": True})
+
+    def get_messages(self, ip, query):
+        after, limit = paging(query)
+        messages = read_messages(self.outbox_db, after, limit)
+        log.info("%d message(s) after %d to %s", len(messages), after, ip)
+        self.send_json(200, {"messages": messages})
+
+    def get_replies(self, ip, query):
+        after, limit = paging(query)
+        replies = self.store.since(after, limit)
+        log.info("%d reply(s) after %d to %s", len(replies), after, ip)
+        self.send_json(200, {"replies": replies})
 
 
 def main():
@@ -122,6 +187,7 @@ def main():
     data_dir = env("DATA_DIR", "/data")
 
     InboxHandler.store = ReplyStore(f"{data_dir}/inbox.db")
+    InboxHandler.outbox_db = env("OUTBOX_DB", "/outbox/outbox.db")
     InboxHandler.token = token.encode()
     InboxHandler.per_ip = RateLimiter(env_int("INBOX_RATE_PER_MIN", 20), 60)
     InboxHandler.overall = RateLimiter(env_int("INBOX_RATE_TOTAL_PER_MIN", 120), 60)

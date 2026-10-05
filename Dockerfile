@@ -6,7 +6,7 @@ WORKDIR /app
 COPY lightrelay ./lightrelay
 
 # Unraid's usual owner for appdata: nobody:users (99:100).
-RUN adduser -D -H -u 99 -G users relay && mkdir -p /data /inbox && chown relay:users /data
+RUN adduser -D -H -u 99 -G users relay && mkdir -p /data /inbox /outbox && chown relay:users /data
 USER relay
 VOLUME ["/data"]
 EXPOSE 8080 8081

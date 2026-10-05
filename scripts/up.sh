@@ -42,7 +42,7 @@ echo "==> starting containers"
 docker rm -f light-relay light-relay-inbox >/dev/null 2>&1 || true
 docker run -d --name light-relay-inbox --restart unless-stopped --network host "${RUN_AS[@]}" \
   --env-file "$STATE/inbox.env" -e ROLE=inbox -e HOST=127.0.0.1 -e PORT=18081 \
-  -v "$STATE/inbox:/data" light-relay:local >/dev/null
+  -v "$STATE/inbox:/data" -v "$STATE/relay:/outbox:ro" light-relay:local >/dev/null
 docker run -d --name light-relay --restart unless-stopped --network host "${RUN_AS[@]}" \
   --env-file "$STATE/relay.env" -e ROLE=relay -e HOST=127.0.0.1 -e PORT=18080 \
   -v "$STATE/relay:/data" -v "$STATE/inbox:/inbox:ro" light-relay:local >/dev/null

@@ -52,7 +52,9 @@ def main():
                                     "(e.g. the messageId of the reply you're answering)")
 
     r = sub.add_parser("replies", help="replies not yet acknowledged")
-    r.add_argument("--ack", action="store_true", help="acknowledge what was printed")
+    r.add_argument("--ack", action="store_true",
+                   help="acknowledge everything printed, handled or not; for testing. "
+                        "Normally act on each reply, then `ack <seq>`")
     r.add_argument("--limit", type=int, default=50)
 
     a = sub.add_parser("ack", help="acknowledge replies up to and including a seq")

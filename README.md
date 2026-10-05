@@ -133,6 +133,9 @@ relayctl.py replies --ack
 ```
 
 The agent's scheduled check is `relayctl.py replies`: act on each reply, then `relayctl.py ack <last seq>`.
+`replies --ack` is the shortcut that prints the list and acknowledges all of it at once.
+Use it only when printing is the whole of handling them, as in testing. `ack <seq>`
+acknowledges up to a reply you've actually acted on.
 
 ## Connecting an agent
 
@@ -209,10 +212,16 @@ and an instruction like this in its system prompt, `AGENTS.md` or `CLAUDE.md`:
 > - `relayctl.py notify "<headline>" "<detail>" [--choice A --choice B]` sends a message.
 >   Keep the headline under 120 characters and the detail to two or three plain sentences.
 >   Offer choices when you need a decision. Note the returned `id`.
-> - `relayctl.py replies` lists answers that haven't been handled yet. Match each one to
->   your message by `messageId`, act on it, then run `relayctl.py ack <seq>`.
-> - When you respond to a reply, add `--thread <its messageId>` so it stays in the same
->   conversation on his phone. Start a new conversation only for a new subject.
+> - `relayctl.py replies` lists what he's sent that hasn't been handled yet. Act on each,
+>   then run `relayctl.py ack <seq>` (not `replies --ack`, which acknowledges all of
+>   them unread).
+>   - With a `messageId`, it answers that message of yours. He tapped a choice or typed
+>     a reply.
+>   - With no `messageId` but a `thread` (`t_…`) and `title`, he started the
+>     conversation himself.
+> - When you respond, add `--thread <its messageId, or its thread when there's no
+>   messageId>` so it stays in the same conversation on his phone. Start a new
+>   conversation only for a new subject.
 > - Use it for things worth interrupting him for, at most a few times a day.
 >   Never resend a message to check that it arrived.
 

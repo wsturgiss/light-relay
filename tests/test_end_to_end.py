@@ -1,5 +1,5 @@
-"""The whole loop on loopback: agent -> relay -> fake push endpoint, and
-phone -> inbox -> relay -> agent. Run with `python -m unittest`."""
+"""The whole loop on loopback: agent -> relay -> fake push endpoint,
+agent -> relay -> outbox -> inbox -> phone, and phone -> inbox -> relay -> agent. Run with `python -m unittest`."""
 
 import hashlib
 import hmac
@@ -68,7 +68,9 @@ class EndToEnd(unittest.TestCase):
 
         loopback = frozenset({ipaddress.ip_address("127.0.0.1")})
 
+        outbox_db = f"{self.tmp.name}/outbox.db"
         inbox.InboxHandler.store = inbox.ReplyStore(f"{self.tmp.name}/inbox.db")
+        inbox.InboxHandler.outbox_db = outbox_db
         inbox.InboxHandler.token = REPLY_TOKEN.encode()
         inbox.InboxHandler.per_ip = RateLimiter(5, 60)
         inbox.InboxHandler.overall = RateLimiter(1000, 60)
@@ -79,6 +81,7 @@ class EndToEnd(unittest.TestCase):
         relay.RelayHandler.push_endpoint = push_url + "/push/abc"
         relay.RelayHandler.push_key = PUSH_KEY
         relay.RelayHandler.notify_limit = RateLimiter(100, 3600)
+        relay.RelayHandler.outbox = relay.Outbox(outbox_db)
         relay.RelayHandler.inbox_db = f"{self.tmp.name}/inbox.db"
         relay.RelayHandler.cursor = relay.Cursor(f"{self.tmp.name}/cursor.json")
         relay.RelayHandler.trusted_proxies = loopback
@@ -88,11 +91,21 @@ class EndToEnd(unittest.TestCase):
         for s in (self.push, self.inbox, self.relay):
             s.shutdown()
             s.server_close()
+        inbox.InboxHandler.store.db.close()
+        relay.RelayHandler.outbox.db.close()
         self.tmp.cleanup()
 
     def reply(self, body, token=REPLY_TOKEN, via="203.0.113.5"):
         return request(self.inbox_url + "/replies", "POST", body,
                        {"Authorization": f"Bearer {token}"}, via=via)
+
+    def fetch(self, path, token=REPLY_TOKEN, via="203.0.113.5"):
+        return request(self.inbox_url + path, headers={"Authorization": f"Bearer {token}"}, via=via)
+
+    def notify(self, headline):
+        status, body = request(self.relay_url + "/notify", "POST", {"headline": headline}, via=AGENT_IP)
+        self.assertEqual(status, 202)
+        return body
 
     # agent -> phone
 
@@ -136,16 +149,64 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(status, 400, body)
         self.assertEqual(FakePush.received, [])
 
-    def test_push_failure_is_reported_to_agent(self):
+    def test_failed_push_still_waits_in_the_outbox(self):
         FakePush.status = 410
-        status, body = request(self.relay_url + "/notify", "POST", {"headline": "hi"}, via=AGENT_IP)
-        self.assertEqual(status, 502)
-        self.assertIn("410", body["error"])
+        sent = self.notify("hi")
+        self.assertFalse(sent["pushed"])
+        messages = self.fetch("/messages")[1]["messages"]
+        self.assertEqual([json.loads(m["body"].split(".", 2)[2])["id"] for m in messages], [sent["id"]])
+
+    def test_without_a_push_endpoint_messages_wait_to_be_fetched(self):
+        relay.RelayHandler.push_endpoint = None
+        sent = self.notify("hi")
+        self.assertFalse(sent["pushed"])
+        self.assertEqual(FakePush.received, [])
+
+        status, body = self.fetch("/messages")
+        self.assertEqual(status, 200)
+        version, mac, payload = body["messages"][0]["body"].split(".", 2)
+        self.assertEqual(mac, hmac.new(PUSH_KEY, payload.encode(), hashlib.sha256).hexdigest())
+        self.assertEqual(json.loads(payload)["id"], sent["id"])
+
+    def test_pushed_and_fetched_bodies_are_identical(self):
+        self.assertTrue(self.notify("hi")["pushed"])
+        self.assertEqual(self.fetch("/messages")[1]["messages"][0]["body"].encode(), FakePush.received[0])
+
+    def test_new_keys_re_sign_the_kept_history(self):
+        self.notify("before new keys")
+        new_key = b"n" * 43
+        self.assertEqual(relay.RelayHandler.outbox.resign(new_key), 1)
+        _, mac, payload = self.fetch("/messages")[1]["messages"][0]["body"].split(".", 2)
+        self.assertEqual(mac, hmac.new(new_key, payload.encode(), hashlib.sha256).hexdigest())
+        self.assertEqual(json.loads(payload)["headline"], "before new keys")
+        self.assertEqual(relay.RelayHandler.outbox.resign(new_key), 0)
 
     def test_unpaired_relay_answers_503(self):
-        relay.RelayHandler.push_endpoint = None
+        relay.RelayHandler.push_key = None
         status, _ = request(self.relay_url + "/notify", "POST", {"headline": "hi"}, via=AGENT_IP)
         self.assertEqual(status, 503)
+
+    def test_fetch_pages_past_the_tools_place(self):
+        ids = [self.notify(f"m{i}")["id"] for i in range(3)]
+        first = self.fetch("/messages?limit=2")[1]["messages"]
+        self.assertEqual(len(first), 2)
+        rest = self.fetch(f"/messages?after={first[-1]['seq']}")[1]["messages"]
+        got = [json.loads(m["body"].split(".", 2)[2])["id"] for m in first + rest]
+        self.assertEqual(got, ids)
+        # Fetching keeps no state: the same read gives the same answer.
+        self.assertEqual(self.fetch("/messages?limit=2")[1]["messages"], first)
+
+    def test_fetch_needs_the_token(self):
+        self.notify("hi")
+        for path in ("/messages", "/replies"):
+            self.assertEqual(request(self.inbox_url + path)[0], 401, path)
+            self.assertEqual(self.fetch(path, token="nope")[0], 401, path)
+
+    def test_bad_paging_is_rejected(self):
+        self.assertEqual(self.fetch("/messages?after=x")[0], 400)
+
+    def test_fetch_before_any_message_is_empty(self):
+        self.assertEqual(self.fetch("/messages"), (200, {"messages": []}))
 
     # phone -> agent
 
@@ -167,6 +228,15 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.reply({"id": "r1", "text": "hello"})[0], 202)
         self.assertEqual(len(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"]), 1)
 
+    def test_tool_can_read_back_its_replies(self):
+        self.reply({"id": "r1", "messageId": "m_1", "choice": "Yes"})
+        self.reply({"id": "r2", "messageId": "m_1", "text": "and the return"})
+        replies = self.fetch("/replies")[1]["replies"]
+        self.assertEqual([(r["id"], r["messageId"]) for r in replies], [("r1", "m_1"), ("r2", "m_1")])
+        self.assertEqual(self.fetch(f"/replies?after={replies[0]['seq']}")[1]["replies"][0]["id"], "r2")
+        # The tool's reads don't move the agent's cursor.
+        self.assertEqual(len(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"]), 2)
+
     def test_stranger_cannot_read_replies(self):
         self.reply({"id": "r1", "text": "hello"})
         self.assertEqual(request(self.relay_url + "/replies", via=STRANGER_IP)[0], 403)
@@ -175,9 +245,10 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(request(self.inbox_url + "/replies", "POST", {"id": "r1", "text": "x"})[0], 401)
         self.assertEqual(self.reply({"id": "r1", "text": "x"}, token="nope")[0], 401)
 
-    def test_inbox_offers_nothing_but_posting_replies(self):
+    def test_inbox_offers_nothing_else(self):
         self.reply({"id": "r1", "text": "hello"})
-        for method, path in (("GET", "/replies"), ("GET", "/"), ("DELETE", "/replies"), ("POST", "/notify")):
+        for method, path in (("GET", "/"), ("DELETE", "/replies"), ("POST", "/notify"),
+                             ("POST", "/messages"), ("GET", "/healthz")):
             status, _ = request(self.inbox_url + path, method,
                                 headers={"Authorization": f"Bearer {REPLY_TOKEN}"})
             self.assertEqual(status, 404, (method, path))

@@ -28,6 +28,7 @@ services:
       TRUSTED_PROXIES: 127.0.0.1,::1,172.17.0.1
     volumes:
       - ./data/inbox:/data
+      - ./data/relay:/outbox:ro
     ports:
       - 127.0.0.1:8081:8081
     restart: unless-stopped

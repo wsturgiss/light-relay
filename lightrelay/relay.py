@@ -4,8 +4,10 @@ The agent sends it messages for the phone (POST /notify) and collects replies
 from it (GET /replies, POST /replies/ack). Every route but /healthz accepts
 only the tailnet devices listed in ALLOWED_PEERS.
 
-A message becomes one push to the Relay Inbox tool's UnifiedPush endpoint,
-which lives on Light's push server. The relay never needs a route to the phone.
+A message is signed and kept in the outbox, where the Relay Inbox tool fetches
+it through the inbox's GET /messages. If the tool has a UnifiedPush endpoint on
+Light's push server, the message is also pushed there. Either way the relay
+never needs a route to the phone.
 """
 
 import hashlib
@@ -16,6 +18,7 @@ import re
 import secrets
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -29,6 +32,18 @@ MAX_DETAIL = 1000
 MAX_CHOICES = 4
 MAX_CHOICE = 24
 REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+RETAIN_DAYS = 90
+MAX_ROWS = 5000
+
+OUTBOX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    id      TEXT NOT NULL UNIQUE,
+    at      TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    body    TEXT NOT NULL
+);
+"""
 
 
 def now_iso():
@@ -92,9 +107,52 @@ def sign(message, key):
     Anyone who learns the push endpoint can post to it; the tool drops anything
     that doesn't carry a valid signature under the key it generated at pairing.
     """
-    payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+    return sign_payload(json.dumps(message, separators=(",", ":"), ensure_ascii=False), key)
+
+
+def sign_payload(payload, key):
     mac = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
     return f"v1.{mac}.{payload}".encode()
+
+
+class Outbox:
+    """Every signed message, for the tool to fetch through the inbox, which
+    mounts this database read-only. Kept whether or not the push got through."""
+
+    def __init__(self, path):
+        # Rollback journal, not WAL: the inbox opens this file read-only from
+        # another container, and a WAL reader needs write access to -shm.
+        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=DELETE")
+        self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.executescript(OUTBOX_SCHEMA)
+        self.lock = threading.Lock()
+
+    def add(self, message, body):
+        payload = body.decode().split(".", 2)[2]
+        with self.lock:
+            self.db.execute("INSERT INTO messages (id, at, payload, body) VALUES (?, ?, ?, ?)",
+                            (message["id"], message["at"], payload, body.decode()))
+            self._prune()
+
+    def resign(self, key):
+        """Sign everything kept under `key`. New keys on the phone (or a reinstall)
+        would otherwise leave the whole history failing its signature check."""
+        with self.lock:
+            changed = []
+            for seq, payload, body in self.db.execute("SELECT seq, payload, body FROM messages").fetchall():
+                signed = sign_payload(payload, key).decode()
+                if signed != body:
+                    changed.append((signed, seq))
+            if changed:
+                self.db.executemany("UPDATE messages SET body = ? WHERE seq = ?", changed)
+            return len(changed)
+
+    def _prune(self):
+        cutoff = datetime.fromtimestamp(time.time() - RETAIN_DAYS * 86400, timezone.utc)
+        self.db.execute("DELETE FROM messages WHERE at < ?", (cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),))
+        self.db.execute(
+            "DELETE FROM messages WHERE seq <= (SELECT MAX(seq) FROM messages) - ?", (MAX_ROWS,))
 
 
 class Cursor:
@@ -147,13 +205,14 @@ class RelayHandler(Handler):
     push_key = None
     push_timeout = 15
     notify_limit = None
+    outbox = None
     inbox_db = None
     cursor = None
 
     def route(self, method):
         url = urlsplit(self.path)
         if method == "GET" and url.path == "/healthz":
-            return self.send_json(200, {"ok": True, "paired": bool(self.push_endpoint and self.push_key)})
+            return self.send_json(200, {"ok": True, "paired": bool(self.push_key), "push": bool(self.push_endpoint)})
 
         ip = self.client_ip()
         if ip not in self.allowed_peers:
@@ -169,15 +228,24 @@ class RelayHandler(Handler):
         raise HttpError(404, "not found")
 
     def notify(self):
-        if not (self.push_endpoint and self.push_key):
-            raise HttpError(503, "not paired: set PUSH_ENDPOINT and PUSH_KEY")
+        if not self.push_key:
+            raise HttpError(503, "not paired: set PUSH_KEY")
         message = parse_message(self.headers.get("Content-Type", "text/plain"), self.read_body())
         if not self.notify_limit.allow("notify"):
             raise HttpError(429, "notify rate limit reached")
 
+        body = sign(message, self.push_key)
+        self.outbox.add(message, body)
+        pushed = self.push(message, body) if self.push_endpoint else False
+        log.info("stored %s (%s)", message["id"], "pushed" if pushed else "waiting to be fetched")
+        self.send_json(202, {"id": message["id"], "at": message["at"], "pushed": pushed})
+
+    def push(self, message, body):
+        """Best effort: a message that doesn't push still waits in the outbox,
+        so a failure here is logged, not handed back to the agent to retry."""
         request = urllib.request.Request(
             self.push_endpoint,
-            data=sign(message, self.push_key),
+            data=body,
             method="POST",
             headers={"Content-Type": "text/plain; charset=utf-8", "TTL": "86400", "Urgency": "high"},
         )
@@ -185,16 +253,15 @@ class RelayHandler(Handler):
             with urllib.request.urlopen(request, timeout=self.push_timeout) as resp:
                 status = resp.status
         except urllib.error.HTTPError as e:
-            status = e.code
+            with e:
+                status = e.code
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             log.warning("push for %s failed: %s", message["id"], e)
-            raise HttpError(502, "push endpoint unreachable")
+            return False
         if not 200 <= status < 300:
             log.warning("push for %s rejected with HTTP %d", message["id"], status)
-            raise HttpError(502, f"push endpoint returned HTTP {status}")
-
-        log.info("pushed %s", message["id"])
-        self.send_json(202, {"id": message["id"], "at": message["at"]})
+            return False
+        return True
 
     def replies(self, query):
         try:
@@ -224,14 +291,19 @@ def main():
     RelayHandler.push_key = push_key.encode() if push_key else None
     RelayHandler.push_timeout = env_int("PUSH_TIMEOUT", 15)
     RelayHandler.notify_limit = RateLimiter(env_int("NOTIFY_RATE_PER_HOUR", 60), 3600)
+    RelayHandler.outbox = Outbox(env("OUTBOX_DB", f"{data_dir}/outbox.db"))
+    if RelayHandler.push_key and (n := RelayHandler.outbox.resign(RelayHandler.push_key)):
+        log.info("re-signed %d kept message(s) under the current PUSH_KEY", n)
     RelayHandler.inbox_db = env("INBOX_DB", "/inbox/inbox.db")
     RelayHandler.cursor = Cursor(f"{data_dir}/cursor.json")
     RelayHandler.trusted_proxies = parse_ips(env("TRUSTED_PROXIES", "127.0.0.1,::1"))
     RelayHandler.client_ip_header = env("CLIENT_IP_HEADER", "X-Forwarded-For")
     RelayHandler.max_body = env_int("RELAY_MAX_BODY", 8192)
 
-    if not (RelayHandler.push_endpoint and RelayHandler.push_key):
-        log.warning("not paired yet: /notify will answer 503 until PUSH_ENDPOINT and PUSH_KEY are set")
+    if not RelayHandler.push_key:
+        log.warning("not paired yet: /notify will answer 503 until PUSH_KEY is set")
+    elif not RelayHandler.push_endpoint:
+        log.info("no PUSH_ENDPOINT: messages wait in the outbox for the tool to fetch")
     log.info("allowed peers: %s", ", ".join(sorted(map(str, allowed))))
 
     serve(RelayHandler, env("HOST", "0.0.0.0"), env_int("PORT", 8080)).serve_forever()

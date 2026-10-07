@@ -10,6 +10,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("lightrelay")
 
+# A reply as both the agent (via the relay) and the tool (via the inbox) read it.
+REPLY_COLUMNS = "seq, id, message_id, thread, title, choice, text, sent_at, received_at"
+
+
+def reply_from_row(r):
+    return {"seq": r[0], "id": r[1], "messageId": r[2], "thread": r[3], "title": r[4],
+            "choice": r[5], "text": r[6], "sentAt": r[7], "receivedAt": r[8]}
+
 
 def env(name, default=None, required=False):
     value = os.environ.get(name, "").strip()

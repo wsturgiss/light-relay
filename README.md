@@ -18,6 +18,8 @@ phone make every request. The relay's only outbound call is the push to the phon
 
 > **Status:** push delivery to the tool doesn't work until Light fixes a LightOS bug. The
 > phone fetches new messages instead, every 15 minutes and whenever the tool is opened.
+> Once push works, the inbox can shrink to accepting replies only. It stays public,
+> because the phone isn't on the tailnet and needs somewhere to send replies.
 
 The code uses the Python standard library only. Run the tests with `python -m unittest`.
 

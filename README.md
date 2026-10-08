@@ -27,47 +27,76 @@ The code uses the Python standard library only. Run the tests with `python -m un
 
 You need Docker and Tailscale on the host, and
 [Funnel enabled](https://tailscale.com/kb/1223/funnel) for that node in your tailnet policy.
+The inbox's address will be `https://<host>.<tailnet>.ts.net:8443/replies`.
 
-1. **Start it**, naming the tailnet IPs allowed to call the relay (`tailscale ip -4 <device>`):
+1. **Pair the phone.** Build the tool with the inbox's address as `relay.inboxUrl`, then
+   open **Pairing** and copy `PUSH_KEY`, `REPLY_TOKEN` and, if LightOS issued one,
+   `PUSH_ENDPOINT`. The tool's README covers both steps.
 
-   ```bash
-   scripts/up.sh ~/.local/share/light-relay 100.64.0.7,100.64.0.8
-   ```
-
-   `up.sh` builds the image and starts both containers on `127.0.0.1` (relay on port
-   18080, inbox on 18081). It then publishes them with `tailscale serve` and
-   `tailscale funnel` and prints both URLs. The first run creates `relay.env` and
-   `inbox.env` in the state directory. Later runs never overwrite them.
-
-2. **Pair the phone.** In the tool, open **Pairing** and copy `PUSH_KEY`, `REPLY_TOKEN` and,
-   if LightOS issued one, `PUSH_ENDPOINT` into the two `.env` files. Build the inbox URL into
-   the tool as `relay.inboxUrl`. The tool's README covers both steps.
-
-3. **Re-run `scripts/up.sh`** to apply the settings. Re-run it after any change to an `.env`
-   file or the code.
-
-4. **Test it** from an allowed device:
+2. **Write the settings**, with the tailnet IPs allowed to call the relay
+   (`tailscale ip -4 <device>`) and the values from the phone:
 
    ```bash
-   curl https://<relay host>.<tailnet>.ts.net/healthz    # {"ok": true, "paired": true, ...}
+   STATE=~/.local/share/light-relay
+   mkdir -p $STATE/relay $STATE/inbox
+   printf 'ALLOWED_PEERS=100.64.0.7,100.64.0.8\nPUSH_KEY=…\nPUSH_ENDPOINT=…\n' > $STATE/relay.env
+   printf 'REPLY_TOKEN=…\n' > $STATE/inbox.env
+   chmod 600 $STATE/*.env
    ```
 
-To deploy to an Unraid box over SSH, run `scripts/deploy-unraid.sh root@<host> <allowed IPs>`.
-It copies the source over and runs `up.sh` there, with state in
-`/mnt/user/appdata/light-relay`. `docker-compose.yml` shows how to run the pair without
-`up.sh`, and is there for reference only.
+3. **Build and start** both containers on `127.0.0.1`, the relay on port 18080 and the
+   inbox on 18081:
+
+   ```bash
+   docker build -t light-relay .
+   docker run -d --name light-relay-inbox --restart unless-stopped --network host \
+     --user "$(id -u):$(id -g)" --env-file $STATE/inbox.env \
+     -e ROLE=inbox -e HOST=127.0.0.1 -e PORT=18081 \
+     -v $STATE/inbox:/data -v $STATE/relay:/outbox:ro light-relay
+   docker run -d --name light-relay --restart unless-stopped --network host \
+     --user "$(id -u):$(id -g)" --env-file $STATE/relay.env \
+     -e ROLE=relay -e HOST=127.0.0.1 -e PORT=18080 \
+     -v $STATE/relay:/data -v $STATE/inbox:/inbox:ro light-relay
+   ```
+
+4. **Publish** the relay to the tailnet and the inbox to the internet:
+
+   ```bash
+   tailscale serve  --bg --https=443  http://127.0.0.1:18080
+   tailscale funnel --bg --https=8443 http://127.0.0.1:18081
+   ```
+
+5. **Test it** from an allowed device:
+
+   ```bash
+   curl https://<host>.<tailnet>.ts.net/healthz    # {"ok": true, "paired": true, ...}
+   ```
+
+Docker reads an `.env` file only when it creates a container. To apply a change, remove the
+container with `docker rm -f` and run it again. `scripts/up.sh [state dir] [allowed IPs]`
+does steps 2 to 4 in one go and is safe to re-run. On the first run it writes a stand-in
+`REPLY_TOKEN` for you to replace.
+
+**On Unraid:**
+
+- Put the state in `/mnt/user/appdata/light-relay`.
+- Leave out `--user`. The image already runs as `nobody:users` (99:100), Unraid's appdata
+  owner, so `chown 99:100` the `relay` and `inbox` directories instead.
+- Tailscale must be installed on the Unraid host itself for step 4.
+- `scripts/deploy-unraid.sh root@<host> [allowed IPs]` copies the source over SSH and runs
+  `up.sh` there.
 
 ## Connect an agent
 
 The agent needs a device on the tailnet. It holds no secrets: the relay identifies it by
 its tailnet IP.
 
-1. Add the device's IP to `ALLOWED_PEERS` in `relay.env` and re-run `scripts/up.sh`.
+1. Add the device's IP to `ALLOWED_PEERS` in `relay.env`, then recreate the relay container.
 2. Copy [`agent/relayctl.py`](agent/relayctl.py) to the device. It needs only Python 3.
 3. Send a message, and check for replies on a schedule:
 
    ```bash
-   export RELAY_URL=https://<relay host>.<tailnet>.ts.net
+   export RELAY_URL=https://<host>.<tailnet>.ts.net
    relayctl.py notify "Book the 9:40?" "Holds expire at noon." --choice Yes --choice No
    # {"id": "m_691c2570d10b8b8a", "at": "…", "thread": "m_691c2570d10b8b8a", "pushed": true}
    relayctl.py replies       # unacknowledged replies, as JSON
@@ -112,7 +141,7 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `CLIENT_IP_HEADER` | both | `X-Forwarded-For` | |
 | `LOG_LEVEL` | both | `INFO` | |
 
-`up.sh` sets `ROLE`, `HOST`, `PORT` and the database paths itself.
+The `docker run` commands set `ROLE`, `HOST` and `PORT`. The database paths follow the mounts.
 
 ## Security
 
@@ -131,7 +160,7 @@ your own devices reach the relay's node.
 - **No token:** the inbox answers `401` before reading the body, and rate limits cap the
   load. Funnel has no DDoS protection.
 
-**On one host,** `up.sh` runs both containers on the host network. The inbox cannot reach the
+**On one host,** these commands run both containers on the host network. The inbox cannot reach the
 relay through its own code, but the network doesn't stop it: if the inbox process were
 compromised, it could call the relay on loopback with a forged header.
 
@@ -141,8 +170,8 @@ compromised, it could call the relay on loopback with a forged header.
 - `docker stop light-relay`: no pushes, and no replies handed out.
 - `docker stop light-relay-inbox`, or `tailscale funnel --https=8443 off`: the public
   surface is gone.
-- Tap **New keys** in the tool, then put the new values in the `.env` files and re-run
-  `up.sh`. The old push key and reply token stop working. The relay re-signs its stored
+- Tap **New keys** in the tool, then put the new values in the `.env` files and recreate
+  both containers. The old push key and reply token stop working. The relay re-signs its stored
   messages with the new key, so the tool keeps its history.
 
 ## Roadmap

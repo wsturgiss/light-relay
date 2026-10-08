@@ -9,15 +9,12 @@ from the blueprint, it says so under **Differences from the blueprint** below.
 
 ## How it fits together
 
-```
-                 tailnet only (Serve)                        Light's push server
- agent ("muse") ────POST /notify────▶  relay  ──signed push──▶  (UnifiedPush)  ──▶  LP3: Relay Inbox
-      ▲                                  │  ▲   (if paired for push)                       │  ▲
-      └────GET /replies, POST /ack───────┘  │                                              │  │
-                          outbox.db (ro) ▼  │ inbox.db (ro)                                │  │
-                                          inbox  ◀──────POST /replies (bearer)─────────────┘  │
-                                   public (Funnel) ──────GET /messages, /replies (bearer)─────┘
-```
+![The agent posts to the relay over the tailnet; the relay writes outbox.db and pushes through Light's push server; the public inbox serves the outbox to the phone and stores its replies in inbox.db, which the relay hands back to the agent.](docs/flow.svg)
+
+Messages travel left to right and replies right to left. The agent and the phone
+make every request; the relay's only outbound call is the push, and push delivery
+to the tool is broken until the Light team ships a fix, so for now the phone gets
+everything by polling the inbox.
 
 Two containers from one image:
 

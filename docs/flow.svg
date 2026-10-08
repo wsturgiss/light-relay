@@ -63,7 +63,7 @@
   <!-- agent -->
   <rect class="box" x="30" y="80" width="160" height="72" rx="8"/>
   <text class="name" x="110" y="110" text-anchor="middle">agent</text>
-  <text class="sub" x="110" y="132" text-anchor="middle">“muse” · tailnet device</text>
+  <text class="sub" x="110" y="132" text-anchor="middle">any tailnet device</text>
 
   <!-- relay -->
   <rect class="box" x="300" y="80" width="220" height="72" rx="8"/>

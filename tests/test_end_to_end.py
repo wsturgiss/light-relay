@@ -182,7 +182,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(relay.RelayHandler.outbox.resign(new_key), 0)
 
     def test_a_follow_up_joins_the_first_messages_thread(self):
-        first = self.notify("Muse tailnet test")
+        first = self.notify("Tailnet test")
         self.assertEqual(first["thread"], first["id"])
         second = request(self.relay_url + "/notify", "POST",
                          {"headline": "Got your Got it", "thread": first["id"]}, via=AGENT_IP)[1]

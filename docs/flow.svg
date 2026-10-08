@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" role="img" aria-label="The agent posts to the relay over the tailnet. The relay writes the outbox and tries a signed push through Light's push server, which is broken until the Light team fixes delivery. The public inbox reads the outbox through a read-only mount and serves it to the phone; the phone posts replies to the inbox, which writes inbox.db, and the relay reads that back for the agent.">
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .call, .note, .tag { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .name { font-size: 16px; font-weight: 600; }
+    .sub { font-size: 12px; }
+    .call { font-size: 11.5px; }
+    .note { font-size: 11px; }
+    .tag { font-size: 11px; letter-spacing: 0.06em; }
+    .key { font-size: 12px; }
+    .box, .box-public, .db, .zone, .flow, .flow-ro, .flow-public, .flow-broken { stroke-width: 1.5; }
+    .zone, .flow, .flow-ro, .flow-public, .flow-broken { fill: none; }
+    .zone { stroke-dasharray: 6 5; }
+    .flow-ro, .flow-broken { stroke-dasharray: 4 4; }
+    .homebar { stroke-width: 3; stroke-linecap: round; }
+    .bg { fill: #ffffff; }
+    .box { fill: #ffffff; stroke: #8e9a95; }
+    .box-public { fill: #e6eef7; stroke: #1f5f9e; }
+    .zone { stroke: #b9c3bf; }
+    .db { fill: #ffffff; stroke: #8e9a95; }
+    .name, .call { fill: #1b2220; }
+    .sub, .note, .tag, .key { fill: #5d6a65; }
+    .public { fill: #1f5f9e; }
+    .broken { fill: #b42318; }
+    .flow, .flow-ro { stroke: #1b2220; }
+    .flow-public { stroke: #1f5f9e; }
+    .flow-broken { stroke: #b42318; }
+    .homebar { stroke: #b9c3bf; }
+    .head-ink { fill: #1b2220; }
+    .head-public { fill: #1f5f9e; }
+    .head-broken { fill: #b42318; }
+    @media (prefers-color-scheme: dark) {
+    .bg { fill: #0d1117; }
+    .box { fill: #161b22; stroke: #7d8a85; }
+    .box-public { fill: #1a2734; stroke: #82b4e6; }
+    .zone { stroke: #3a4440; }
+    .db { fill: #161b22; stroke: #7d8a85; }
+    .name, .call { fill: #e3e9e6; }
+    .sub, .note, .tag, .key { fill: #94a29c; }
+    .public { fill: #82b4e6; }
+    .broken { fill: #f07a6c; }
+    .flow, .flow-ro { stroke: #e3e9e6; }
+    .flow-public { stroke: #82b4e6; }
+    .flow-broken { stroke: #f07a6c; }
+    .homebar { stroke: #3a4440; }
+    .head-ink { fill: #e3e9e6; }
+    .head-public { fill: #82b4e6; }
+    .head-broken { fill: #f07a6c; }
+    }
+  </style>
+  <defs>
+    <marker id="a-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-ink"/></marker>
+    <marker id="a-public" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-public"/></marker>
+    <marker id="a-broken" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head-broken"/></marker>
+  </defs>
+
+  <rect class="bg" width="1000" height="520"/>
+
+  <!-- docker host -->
+  <rect class="zone" x="270" y="36" width="280" height="420" rx="12"/>
+  <text class="tag" x="286" y="58">DOCKER HOST</text>
+
+  <!-- agent -->
+  <rect class="box" x="30" y="80" width="160" height="72" rx="8"/>
+  <text class="name" x="110" y="110" text-anchor="middle">agent</text>
+  <text class="sub" x="110" y="132" text-anchor="middle">“muse” · tailnet device</text>
+
+  <!-- relay -->
+  <rect class="box" x="300" y="80" width="220" height="72" rx="8"/>
+  <text class="name" x="410" y="110" text-anchor="middle">relay</text>
+  <text class="sub" x="410" y="132" text-anchor="middle">Tailscale Serve · tailnet only</text>
+
+  <!-- agent <-> relay -->
+  <line class="flow" x1="190" y1="102" x2="298" y2="102" marker-end="url(#a-ink)"/>
+  <text class="call" x="245" y="94" text-anchor="middle">POST /notify</text>
+  <line class="flow" x1="298" y1="132" x2="192" y2="132" marker-end="url(#a-ink)"/>
+  <text class="call" x="245" y="152" text-anchor="middle">GET /replies</text>
+  <text class="call" x="245" y="167" text-anchor="middle">POST /replies/ack</text>
+
+  <!-- databases -->
+  <path class="db" d="M310,232 v46 a45,8 0 0,0 90,0 v-46 a45,8 0 0,0 -90,0 a45,8 0 0,0 90,0"/>
+  <text class="call" x="355" y="266" text-anchor="middle">outbox.db</text>
+  <path class="db" d="M420,232 v46 a45,8 0 0,0 90,0 v-46 a45,8 0 0,0 -90,0 a45,8 0 0,0 90,0"/>
+  <text class="call" x="465" y="266" text-anchor="middle">inbox.db</text>
+
+  <!-- relay writes outbox, reads inbox.db -->
+  <line class="flow" x1="355" y1="152" x2="355" y2="221" marker-end="url(#a-ink)"/>
+  <line class="flow-ro" x1="465" y1="223" x2="465" y2="154" marker-end="url(#a-ink)"/>
+
+  <!-- inbox -->
+  <rect class="box-public" x="300" y="360" width="220" height="72" rx="8"/>
+  <text class="name" x="410" y="390" text-anchor="middle">inbox</text>
+  <text class="sub public" x="410" y="412" text-anchor="middle">Tailscale Funnel · public</text>
+
+  <!-- inbox writes inbox.db, reads outbox -->
+  <line class="flow" x1="465" y1="360" x2="465" y2="289" marker-end="url(#a-ink)"/>
+  <line class="flow-ro" x1="355" y1="287" x2="355" y2="358" marker-end="url(#a-ink)"/>
+
+  <!-- push server -->
+  <rect class="box" x="620" y="80" width="170" height="72" rx="8"/>
+  <text class="name" x="705" y="110" text-anchor="middle">Light push server</text>
+  <text class="sub" x="705" y="132" text-anchor="middle">UnifiedPush</text>
+
+  <!-- relay -> push -->
+  <line class="flow" x1="520" y1="116" x2="618" y2="116" marker-end="url(#a-ink)"/>
+  <text class="call" x="570" y="108" text-anchor="middle">signed push</text>
+  <text class="note" x="570" y="134" text-anchor="middle">if paired</text>
+
+  <!-- phone -->
+  <rect class="box" x="860" y="80" width="120" height="352" rx="20"/>
+  <text class="name" x="920" y="110" text-anchor="middle">LP3</text>
+  <text class="sub" x="920" y="132" text-anchor="middle">Relay Inbox</text>
+  <line x1="900" y1="420" x2="940" y2="420" class="homebar"/>
+
+  <!-- push -> phone, broken -->
+  <line class="flow-broken" x1="790" y1="116" x2="858" y2="116" marker-end="url(#a-broken)"/>
+  <text class="note broken" x="705" y="174" text-anchor="middle">broken, waiting on</text>
+  <text class="note broken" x="705" y="189" text-anchor="middle">Light team bugfix</text>
+
+  <!-- phone <-> inbox -->
+  <line class="flow-public" x1="858" y1="378" x2="522" y2="378" marker-end="url(#a-public)"/>
+  <text class="call" x="690" y="370" text-anchor="middle">POST /replies</text>
+  <line class="flow-public" x1="520" y1="418" x2="858" y2="418" marker-end="url(#a-public)"/>
+  <text class="call" x="690" y="410" text-anchor="middle">GET /messages, /replies</text>
+  <text class="note" x="690" y="440" text-anchor="middle">bearer REPLY_TOKEN · on open + every 15 min</text>
+
+  <!-- legend -->
+  <line class="flow" x1="30" y1="494" x2="64" y2="494"/>
+  <text class="key" x="72" y="498">data moves this way</text>
+  <line class="flow-ro" x1="230" y1="494" x2="264" y2="494"/>
+  <text class="key" x="272" y="498">read-only mount</text>
+  <line class="flow-public" x1="410" y1="494" x2="444" y2="494"/>
+  <text class="key" x="452" y="498">public internet</text>
+  <line class="flow-broken" x1="585" y1="494" x2="619" y2="494"/>
+  <text class="key" x="627" y="498">broken, waiting on a fix</text>
+</svg>

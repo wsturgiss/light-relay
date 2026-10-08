@@ -3,17 +3,23 @@
 #
 #   scripts/up.sh [state dir] [allowed peers]
 #
-# Both containers use the host network and bind 127.0.0.1 only, so nothing is
-# reachable until it's published with `tailscale serve` (relay) and
-# `tailscale funnel` (inbox). Settings live in <state dir>/{relay,inbox}.env;
-# they are created on the first run and never overwritten, so re-running
-# only updates the code.
+# Both containers use the host network and bind 127.0.0.1 only. They are then
+# published with `tailscale serve` (relay, tailnet only) and `tailscale funnel`
+# (inbox, public). Settings live in <state dir>/{relay,inbox}.env. They are
+# created on the first run, which needs the allowed peers (comma-separated
+# tailnet IPs), and never overwritten, so re-running only updates the code.
 
 set -euo pipefail
 
 STATE=${1:-$HOME/.local/share/light-relay}
-PEERS=${2:-"100.68.208.23,$(tailscale ip -4 2>/dev/null | head -1)"}  # muse, plus this machine
+PEERS=${2:-}
 SRC=$(cd "$(dirname "$0")/.." && pwd)
+
+if [ ! -f "$STATE/relay.env" ] && [ -z "$PEERS" ]; then
+  echo "First run: name the tailnet IPs allowed to call the relay, comma-separated:" >&2
+  echo "    $0 $STATE <agent IP>[,<your laptop IP>]    (tailscale ip -4 <device>)" >&2
+  exit 1
+fi
 
 mkdir -p "$STATE/relay" "$STATE/inbox"
 if [ "$(id -u)" = 0 ]; then
@@ -30,6 +36,8 @@ docker build -q -t light-relay:local "$SRC" >/dev/null
 if [ ! -f "$STATE/relay.env" ]; then
   printf 'ALLOWED_PEERS=%s\nPUSH_ENDPOINT=\nPUSH_KEY=\n' "$PEERS" > "$STATE/relay.env"
   echo "==> created $STATE/relay.env (ALLOWED_PEERS=$PEERS; not paired yet)"
+elif [ -n "$PEERS" ]; then
+  echo "==> $STATE/relay.env exists, so '$PEERS' is ignored; edit ALLOWED_PEERS there"
 fi
 if [ ! -f "$STATE/inbox.env" ]; then
   # A stand-in until the phone is paired; replace it with the tool's REPLY_TOKEN.
@@ -52,15 +60,18 @@ echo "==> relay health: $(curl -s http://127.0.0.1:18080/healthz || echo 'NOT RE
 docker logs --tail 5 light-relay 2>&1 | sed 's/^/    relay: /'
 docker logs --tail 5 light-relay-inbox 2>&1 | sed 's/^/    inbox: /'
 
-if command -v tailscale >/dev/null; then
-  NAME=$(tailscale status --json | grep -m1 '"DNSName"' | sed 's/.*: "\(.*\)\.",*/\1/')
-  cat <<EOF
-
-To publish, if not already (check with: tailscale serve status):
-    tailscale serve  --bg --https=443  http://127.0.0.1:18080   # relay: tailnet only
-    tailscale funnel --bg --https=8443 http://127.0.0.1:18081   # inbox: public
-
-    relay  https://$NAME
-    inbox  https://$NAME:8443/replies
-EOF
+if ! command -v tailscale >/dev/null; then
+  echo "==> no tailscale here: publish 127.0.0.1:18080 (tailnet only) and 127.0.0.1:18081 (public) yourself"
+  exit 0
 fi
+
+# Both are idempotent, so re-running leaves an existing setup as it was.
+echo "==> publishing"
+tailscale serve --bg --https=443 http://127.0.0.1:18080 >/dev/null \
+  || echo "    tailscale serve failed: run as root, or once: sudo tailscale set --operator=\$USER"
+tailscale funnel --bg --https=8443 http://127.0.0.1:18081 >/dev/null \
+  || echo "    tailscale funnel failed: is Funnel allowed for this node in the tailnet policy?"
+
+NAME=$(tailscale status --json | grep -m1 '"DNSName"' | sed 's/.*: "\(.*\)\.",*/\1/')
+echo "    relay  https://$NAME              (tailnet only: the agent's RELAY_URL)"
+echo "    inbox  https://$NAME:8443/replies   (public: the tool's relay.inboxUrl)"

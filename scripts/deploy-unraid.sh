@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # Deploy light-relay to an Unraid box for testing.
 #
-#   scripts/deploy-unraid.sh [root@host] [allowed peers]
+#   scripts/deploy-unraid.sh root@<host> [allowed peers]
 #
 # Copies the source over SSH and runs scripts/up.sh there, with its state in
 # /mnt/user/appdata/light-relay. See up.sh for what that does.
 
 set -euo pipefail
 
-TARGET=${1:-root@baconrepo}
-# muse, plus this machine for testing
-PEERS=${2:-"100.68.208.23,$(tailscale ip -4 2>/dev/null | head -1)"}
+TARGET=${1:?usage: deploy-unraid.sh root@<host> [allowed peers]}
+PEERS=${2:-}
 APPDATA=/mnt/user/appdata/light-relay
 
 cd "$(dirname "$0")/.."

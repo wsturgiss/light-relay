@@ -383,5 +383,9 @@ anyone can hammer it. Tailscale gives Funnel no DDoS protection.
 
 Keep them short and plain-text for the LP3's screen: a headline, then the detail.
 
-> **Buy-box alert — 824 Dayton St**
-> 2bd rent cut $2,800 → $2,650. Still above the $1,500 West End 2bd median. Full detail in chat.
+> **New Calendar Event**
+> Susie invited you to "Brainstorming meeting" next month, on Nov 6, 2026 at 7PM EST. Full detail in chat.
+
+# Roadmap
+
+Add E2EE so the phone and services exchange public keys and the relay only transmits encrypted data that it can't read.

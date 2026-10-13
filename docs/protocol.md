@@ -149,8 +149,8 @@ is for one phone.
 
 ## Agent ← relay: `GET /replies`, `POST /replies/ack`
 
-`GET /replies[?limit=<n ≤ 200>][&after=<seq>]` returns replies after the acknowledged
-cursor, oldest first:
+`GET /replies[?limit=<n ≤ 200>][&after=<seq>]` returns replies after the caller's
+acknowledged cursor, oldest first:
 
 ```json
 { "replies": [{ "seq": 3, "id": "r_…", "messageId": "m_…", "thread": null, "title": null,
@@ -167,6 +167,11 @@ its attachment; without one, transcribing it is the agent's job.
 `POST /replies/ack {"upTo": 3}` moves the cursor and returns `{"cursor": 3}`. Acknowledge
 only after the agent has acted on a reply, so a crash in between re-delivers it instead of
 losing it.
+
+**Each agent has its own cursor**, by tailnet IP. Every agent sees every reply, including
+replies to other agents' messages, and acknowledging moves only the caller's cursor. So an
+agent acknowledges up to whatever it has handled or ignored, and can never clear a reply for
+another agent. (Before this, one cursor was shared; each agent starts from where it was.)
 
 `GET /healthz` → `{"ok": true, "paired": <PUSH_KEY set>, "push": <PUSH_ENDPOINT set>}`. It
 is the only relay route open to every tailnet device.

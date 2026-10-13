@@ -140,6 +140,9 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `ATTACHMENT_MAX_BYTES` | inbox | `10485760` | Bytes per voice note or photo |
 | `ATTACHMENT_MAX_TOTAL` | inbox | `524288000` | Bytes kept in all; the oldest go first |
 | `ATTACHMENT_RETAIN_DAYS` | inbox | `30` | Shorter than the 90 days replies are kept |
+| `TRANSCRIBE_API_KEY` | inbox | | Turns on voice-note transcripts (see **Voice transcripts**). An OpenAI key by default. |
+| `TRANSCRIBE_URL` | inbox | `https://api.openai.com/v1/audio/transcriptions` | Any OpenAI-compatible endpoint, e.g. Groq's `https://api.groq.com/openai/v1/audio/transcriptions` |
+| `TRANSCRIBE_MODEL` | inbox | `gpt-4o-mini-transcribe` | `whisper-large-v3-turbo` on Groq |
 | `SESSION_HOST` | inbox | | This host's LAN IP. Turns on short-lived sessions (see **Security**). |
 | `SESSION_PORT` | inbox | `18443` | The LAN-only session door |
 | `SESSION_TTL_HOURS` | inbox | `72` | How long a session lasts away from home |
@@ -149,6 +152,16 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `LOG_LEVEL` | both | `INFO` | |
 
 The `docker run` commands set `ROLE`, `HOST` and `PORT`. The database paths follow the mounts.
+
+### Voice transcripts
+
+With `TRANSCRIBE_API_KEY` set, the inbox sends each voice note to the transcription
+service as it arrives and keeps the text. The phone shows it under the note, and the agent
+finds it on the reply's attachment as `transcript`. Use a key limited to audio with a spending
+cap: it sits in the one container on the internet. The audio leaves your box for the
+service. Without a key, nothing is sent and voice notes go through untranscribed. A note the
+service refuses (a bad key, say) stays untranscribed; one it fails on is tried three times,
+and again when the inbox restarts within a day.
 
 ## Security
 

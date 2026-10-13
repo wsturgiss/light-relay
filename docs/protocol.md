@@ -69,6 +69,16 @@ own position, and reads change nothing on the server.
 
 Messages and replies are kept for 90 days, up to 5000 rows each.
 
+### `GET /transcripts`
+
+Voice notes' text, when the inbox transcribes them (`TRANSCRIBE_API_KEY`). Same paging:
+`{"transcripts": [{"seq": 1, "id": "a_…", "text": "…"}]}`, where `id` is the voice note's
+attachment. A note the service couldn't do has `"text": ""` and an `"error"` for the phone
+to show, such as `"No transcription credit left"`; when the inbox restarts it tries those
+again, and a transcript that follows comes with a new `seq`. A transcript usually lands a few seconds after the reply, so the tool follows this
+feed rather than waiting for it on the reply. `GET /replies` also carries it, as `transcript`
+on the attachment, once there is one. Kept 90 days, past the audio's 30.
+
 ### `POST /replies`
 
 Body ≤ 4 KB. Two forms:
@@ -148,10 +158,11 @@ cursor, oldest first:
 ```
 
 Each reply also carries `"attachments": [{"id": "a_…", "type": "audio/ogg", "bytes": 5004}]`,
-empty when there are none.
+empty when there are none. A voice note the inbox has transcribed also has `"transcript"`, or `"transcriptError"` when it couldn't.
 
 `GET /attachments/<id>` returns the file, with its type as `Content-Type`, or `404` once
-it has expired. Transcribing a voice note is the agent's job; the relay only carries it.
+it has expired. With `TRANSCRIBE_API_KEY` set on the inbox, a voice note's `transcript` is on
+its attachment; without one, transcribing it is the agent's job.
 
 `POST /replies/ack {"upTo": 3}` moves the cursor and returns `{"cursor": 3}`. Acknowledge
 only after the agent has acted on a reply, so a crash in between re-delivers it instead of

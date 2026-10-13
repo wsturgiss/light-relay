@@ -8,12 +8,13 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-from lightrelay import inbox, relay
+from lightrelay import inbox, relay, transcribe
 from lightrelay.common import RateLimiter, serve
 
 AGENT_IP = "100.64.0.7"
@@ -33,6 +34,27 @@ class FakePush(BaseHTTPRequestHandler):
         self.send_response(self.status)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class FakeTranscriber(BaseHTTPRequestHandler):
+    """An OpenAI-style /audio/transcriptions endpoint."""
+    received = []
+    status = 200
+    text = "Pick up milk on the way home."
+    error = {"error": {"code": "invalid_api_key"}}
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.received.append((self.headers["Authorization"], body))
+        payload = json.dumps({"text": self.text} if self.status == 200 else self.error).encode()
+        self.send_response(self.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def log_message(self, *args):
         pass
@@ -417,6 +439,102 @@ class EndToEnd(unittest.TestCase):
         self.upload("a_0000000000000001", VOICE)
         self.assertEqual(self.download("a_0000000000000001", via=STRANGER_IP)[0], 403)
         self.assertEqual(self.download("a_bad")[0], 400)
+
+
+    # transcripts: voice notes to text, through the transcription service
+
+    def transcribing(self, status=200):
+        FakeTranscriber.received, FakeTranscriber.status = [], status
+        inbox.InboxHandler.per_ip = RateLimiter(1000, 60)  # wait_for polls
+        server, url = start(FakeTranscriber)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        worker = transcribe.Transcriber(inbox.InboxHandler.store, "sk-test", url + "/v1/audio/transcriptions",
+                                        retry_delay=0).start()
+        inbox.InboxHandler.transcriber = worker
+        self.addCleanup(setattr, inbox.InboxHandler, "transcriber", None)
+        self.addCleanup(worker.stop)
+        return worker
+
+    def wait_for(self, check):
+        for _ in range(100):
+            if check():
+                return
+            time.sleep(0.02)
+        self.fail("timed out")
+
+    def test_voice_note_is_transcribed_for_the_phone_and_the_agent(self):
+        self.transcribing()
+        self.upload("a_0000000000000001", VOICE)
+        self.reply({"id": "r1", "messageId": "m_1", "attachments": ["a_0000000000000001"]})
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        self.assertEqual(self.fetch("/transcripts")[1]["transcripts"],
+                         [{"seq": 1, "id": "a_0000000000000001", "text": "Pick up milk on the way home."}])
+        self.assertEqual(self.fetch("/transcripts?after=1")[1]["transcripts"], [])
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
+        self.assertEqual(got["attachments"][0]["transcript"], "Pick up milk on the way home.")
+        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["attachments"], got["attachments"])
+        # What went to the service: the key, the model and the file, named so it knows the format.
+        auth, body = FakeTranscriber.received[0]
+        self.assertEqual(auth, "Bearer sk-test")
+        self.assertIn(b'name="model"\r\n\r\ngpt-4o-mini-transcribe', body)
+        self.assertIn(b'filename="a_0000000000000001.ogg"', body)
+        self.assertIn(VOICE, body)
+
+    def test_photos_and_retries_are_not_transcribed(self):
+        self.transcribing()
+        self.upload("a_00000000000000a1", PHOTO, "image/jpeg")
+        self.upload("a_0000000000000001", VOICE)
+        self.upload("a_0000000000000001", VOICE)
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        time.sleep(0.1)
+        self.assertEqual(len(FakeTranscriber.received), 1)
+
+    def test_refused_transcription_says_why(self):
+        self.transcribing(status=401)
+        self.upload("a_0000000000000001", VOICE)
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        self.assertEqual(len(FakeTranscriber.received), 1)  # not retried
+        self.assertEqual(self.fetch("/transcripts")[1]["transcripts"],
+                         [{"seq": 1, "id": "a_0000000000000001", "text": "", "error": "Transcription key refused"}])
+        self.reply({"id": "r1", "attachments": ["a_0000000000000001"]})
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]["attachments"][0]
+        self.assertNotIn("transcript", got)
+        self.assertEqual(got["transcriptError"], "Transcription key refused")
+
+    def test_out_of_credit_is_not_retried_but_comes_back_after_a_restart(self):
+        FakeTranscriber.error = {"error": {"code": "insufficient_quota", "message": "You have no credits remaining."}}
+        self.addCleanup(setattr, FakeTranscriber, "error", {"error": {"code": "invalid_api_key"}})
+        worker = self.transcribing(status=429)
+        self.upload("a_0000000000000001", VOICE)
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        self.assertEqual(len(FakeTranscriber.received), 1)
+        self.assertEqual(self.fetch("/transcripts")[1]["transcripts"][0]["error"], "No transcription credit left")
+        # Credit added, inbox restarted: the note is tried again, and the text follows the error.
+        worker.stop()
+        self.transcribing()
+        self.wait_for(lambda: self.fetch("/transcripts?after=1")[1]["transcripts"])
+        self.assertEqual(self.fetch("/transcripts?after=1")[1]["transcripts"],
+                         [{"seq": 2, "id": "a_0000000000000001", "text": "Pick up milk on the way home."}])
+
+    def test_service_errors_are_retried(self):
+        self.transcribing(status=503)
+        self.upload("a_0000000000000001", VOICE)
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        self.assertEqual(len(FakeTranscriber.received), transcribe.ATTEMPTS)
+        self.assertEqual(self.fetch("/transcripts")[1]["transcripts"][0]["error"], "Transcription service unavailable")
+
+    def test_notes_missed_while_down_are_transcribed_at_start(self):
+        self.upload("a_0000000000000001", VOICE)
+        self.transcribing()
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+
+    def test_relay_reads_an_inbox_without_transcripts(self):
+        self.upload("a_0000000000000001", VOICE)
+        self.reply({"id": "r1", "attachments": ["a_0000000000000001"]})
+        inbox.InboxHandler.store.db.execute("DROP TABLE transcripts")
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"]
+        self.assertEqual(len(got), 1)
 
 
 if __name__ == "__main__":

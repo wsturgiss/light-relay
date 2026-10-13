@@ -25,8 +25,8 @@ import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, env,
-                     env_int, log, parse_ips, reply_from_row, serve, setup_logging)
+from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
+                     env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
 
 MAX_HEADLINE = 120
 MAX_DETAIL = 1000
@@ -205,7 +205,8 @@ def read_inbox(db_path, sql, args):
         db.execute("PRAGMA busy_timeout=5000")
         return db.execute(sql, args).fetchall()
     except sqlite3.OperationalError as e:
-        if "no such table" in str(e):
+        # An older inbox, from before the table or column asked for.
+        if "no such table" in str(e) or "no such column" in str(e):
             return []
         raise
     finally:
@@ -215,7 +216,13 @@ def read_inbox(db_path, sql, args):
 def read_replies(db_path, after, limit):
     rows = read_inbox(db_path, f"SELECT {REPLY_COLUMNS} FROM replies WHERE seq > ? ORDER BY seq LIMIT ?",
                       (after, limit))
-    return [reply_from_row(r) for r in rows]
+    replies = [reply_from_row(r) for r in rows]
+    ids = attachment_ids(replies)
+    # A separate read: an inbox from before transcripts has no such table, and that
+    # mustn't hide the replies.
+    transcripts = read_inbox(db_path, "SELECT attachment_id, text, error FROM transcripts WHERE attachment_id IN"
+                             f" ({','.join('?' * len(ids))})", ids) if ids else []
+    return with_transcripts(replies, {r[0]: (r[1], r[2]) for r in transcripts})
 
 
 class RelayHandler(Handler):

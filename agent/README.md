@@ -72,8 +72,10 @@ reply, with no `text`.
 
 - `relayctl.py attachment <id>` saves it here as `<id>.ogg`, `.jpg` and so on, and prints
   `{"path", "type", "bytes"}`.
-- **Voice notes:** transcribe it, and treat the transcript as the reply's text. If you
-  can't, tell the user you got a voice note you couldn't listen to; don't guess.
+- **Voice notes:** treat the transcript as the reply's text. The relay usually has one,
+  as `"transcript"` on the attachment, a few seconds after the note arrives. If it's
+  missing, check again shortly, or transcribe the note yourself. If neither works, tell
+  the user you got a voice note you couldn't listen to; don't guess.
 - **Photos:** look at it. Answer about what's in it, in the same thread.
 - Fetch them when the reply arrives. They're kept 30 days, then `attachment` fails with
   a `404`.

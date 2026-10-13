@@ -25,9 +25,9 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from . import session
-from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, env,
-                     env_int, log, parse_ips, reply_from_row, serve, setup_logging)
+from . import session, transcribe
+from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
+                     env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_TEXT = 1000
@@ -73,6 +73,16 @@ CREATE TABLE IF NOT EXISTS attachments (
     sha256      TEXT NOT NULL,
     received_at TEXT NOT NULL
 );
+-- A voice note's text, from the transcription service. Its own feed (seq), since
+-- it usually lands after the phone has already fetched the reply. It outlives the
+-- audio, as the reply does.
+CREATE TABLE IF NOT EXISTS transcripts (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    attachment_id TEXT NOT NULL UNIQUE,
+    text          TEXT NOT NULL,
+    at            TEXT NOT NULL,
+    error         TEXT
+);
 """
 
 
@@ -98,6 +108,8 @@ class ReplyStore:
         for column in ("thread", "title", "attachments"):
             if column not in have:
                 self.db.execute(f"ALTER TABLE replies ADD COLUMN {column} TEXT")
+        if "error" not in {row[1] for row in self.db.execute("PRAGMA table_info(transcripts)")}:
+            self.db.execute("ALTER TABLE transcripts ADD COLUMN error TEXT")
         self.lock = threading.Lock()
         # Files sit next to the database, so the relay's read-only mount sees them too.
         self.attachments_dir = attachments_dir or os.path.join(os.path.dirname(os.path.abspath(path)), "attachments")
@@ -161,6 +173,37 @@ class ReplyStore:
             except FileNotFoundError:
                 pass
 
+    def add_transcript(self, attachment_id, text, error=None):
+        """The text, or why there is none. Replacing a row gives it a new seq, so a
+        transcript that follows an error reaches the phone too."""
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO transcripts (attachment_id, text, at, error) VALUES (?, ?, ?, ?)",
+                            (attachment_id, text, now_iso(), error))
+            self.db.execute("DELETE FROM transcripts WHERE at < ?", (days_ago(RETAIN_DAYS),))
+
+    def transcripts_since(self, after, limit):
+        with self.lock:
+            rows = self.db.execute("SELECT seq, attachment_id, text, error FROM transcripts WHERE seq > ?"
+                                   " ORDER BY seq LIMIT ?", (after, limit)).fetchall()
+        return [{"seq": r[0], "id": r[1], "text": r[2], **({"error": r[3]} if r[3] else {})} for r in rows]
+
+    def transcripts_for(self, ids):
+        if not ids:
+            return {}
+        with self.lock:
+            rows = self.db.execute("SELECT attachment_id, text, error FROM transcripts WHERE attachment_id IN"
+                                   f" ({','.join('?' * len(ids))})", ids).fetchall()
+        return {r[0]: (r[1], r[2]) for r in rows}
+
+    def untranscribed(self, days=1):
+        """Recent voice notes with no transcript yet, or only an error, oldest first."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id FROM attachments WHERE type LIKE 'audio/%' AND received_at >= ?"
+                " AND id NOT IN (SELECT attachment_id FROM transcripts WHERE error IS NULL) ORDER BY received_at",
+                (days_ago(days),)).fetchall()
+        return [r[0] for r in rows]
+
     def add(self, reply):
         """Store a reply. Returns False if its id was already stored (a retry)."""
         with self.lock:
@@ -180,7 +223,8 @@ class ReplyStore:
             rows = self.db.execute(
                 f"SELECT {REPLY_COLUMNS} FROM replies WHERE seq > ? ORDER BY seq LIMIT ?",
                 (after, limit)).fetchall()
-        return [reply_from_row(r) for r in rows]
+        replies = [reply_from_row(r) for r in rows]
+        return with_transcripts(replies, self.transcripts_for(attachment_ids(replies)))
 
     def _prune(self):
         self.db.execute("DELETE FROM replies WHERE received_at < ?", (days_ago(RETAIN_DAYS),))
@@ -277,6 +321,7 @@ class InboxHandler(Handler):
     max_attachment = 10 << 20
     per_ip = None
     overall = None
+    transcriber = None
 
     def authorized(self):
         auth = self.headers.get("Authorization", "")
@@ -303,6 +348,8 @@ class InboxHandler(Handler):
             handler = self.get_messages
         elif (method, url.path) == ("GET", "/replies"):
             handler = self.get_replies
+        elif (method, url.path) == ("GET", "/transcripts"):
+            handler = self.get_transcripts
         else:
             raise HttpError(404, "not found")
         # Reject before reading a byte of the body.
@@ -320,6 +367,8 @@ class InboxHandler(Handler):
             attachment_id, content_type, lambda f: self.read_body_to(f, self.max_attachment))
         log.info("attachment %s (%s) from %s (%s)", attachment_id, content_type, ip,
                  "stored" if stored else "duplicate")
+        if stored and self.transcriber and content_type.startswith("audio/"):
+            self.transcriber.submit(attachment_id)
         self.send_json(201 if stored else 200, {"ok": True})
 
     def post_reply(self, ip, _query):
@@ -339,6 +388,12 @@ class InboxHandler(Handler):
         replies = self.store.since(after, limit)
         log.info("%d reply(s) after %d to %s", len(replies), after, ip)
         self.send_json(200, {"replies": replies})
+
+    def get_transcripts(self, ip, query):
+        after, limit = paging(query)
+        transcripts = self.store.transcripts_since(after, limit)
+        log.info("%d transcript(s) after %d to %s", len(transcripts), after, ip)
+        self.send_json(200, {"transcripts": transcripts})
 
 
 class SessionHandler(Handler):
@@ -408,6 +463,15 @@ def main():
     InboxHandler.client_ip_header = env("CLIENT_IP_HEADER", "X-Forwarded-For")
     InboxHandler.max_body = env_int("INBOX_MAX_BODY", 4096)
     InboxHandler.max_attachment = env_int("ATTACHMENT_MAX_BYTES", 10 << 20)
+
+    api_key = env("TRANSCRIBE_API_KEY")
+    if api_key:
+        InboxHandler.transcriber = transcribe.Transcriber(
+            InboxHandler.store, api_key, env("TRANSCRIBE_URL", transcribe.DEFAULT_URL),
+            env("TRANSCRIBE_MODEL", transcribe.DEFAULT_MODEL)).start()
+        log.info("transcribing voice notes with %s at %s", InboxHandler.transcriber.model, InboxHandler.transcriber.url)
+    else:
+        log.info("no TRANSCRIBE_API_KEY: voice notes go through without transcripts")
 
     session_host = env("SESSION_HOST")
     ttl = env_int("SESSION_TTL_HOURS", 72) * 3600

@@ -20,6 +20,23 @@ ATTACHMENT_ID_RE = re.compile(r"^a_[0-9a-f]{16}$")
 ATTACHMENT_COLUMNS = "id, type, bytes, sha256, received_at"
 
 
+def with_transcripts(replies, transcripts):
+    """Puts each voice note's transcript, or why it has none, on the reply's
+    attachment. `transcripts` maps attachment ids to (text, error)."""
+    for reply in replies:
+        for attachment in reply["attachments"]:
+            text, error = transcripts.get(attachment["id"], (None, None))
+            if error:
+                attachment["transcriptError"] = error
+            elif text is not None:
+                attachment["transcript"] = text
+    return replies
+
+
+def attachment_ids(replies):
+    return sorted({a["id"] for r in replies for a in r["attachments"]})
+
+
 def reply_from_row(r):
     return {"seq": r[0], "id": r[1], "messageId": r[2], "thread": r[3], "title": r[4],
             "choice": r[5], "text": r[6], "sentAt": r[7], "receivedAt": r[8],

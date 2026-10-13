@@ -84,6 +84,35 @@ Body ≤ 4 KB. Two forms:
 - The second form starts a conversation from the phone. It has no `messageId`; `thread`
   (`t_` and 16 hex digits) is the new conversation's id, and `title` (≤ 120 characters)
   is its first line. The agent answers with `notify` and that `thread`.
+- Either form can carry `"attachments": ["a_…"]`: up to 4 voice notes or photos,
+  uploaded first. A reply with attachments needs no `choice` or `text`. Naming one that
+  hasn't been uploaded is a `400`, so upload it and send the reply again.
+
+### `PUT /attachments/<id>`
+
+A voice note or a photo, as the raw body. The phone generates `id` (`a_` and 16 hex
+digits); a resend of the same bytes is stored once, and the same `id` with different
+bytes is a `409`.
+
+| `Content-Type` | Must start with |
+|---|---|
+| `audio/ogg` (Opus) | `OggS` |
+| `audio/webm` | the EBML header |
+| `audio/mp4` (AAC) | `ftyp` at byte 4 |
+| `image/jpeg`, `image/png`, `image/webp` | their usual signatures |
+
+| Status | Meaning |
+|---|---|
+| `201` | Stored |
+| `200` | Already stored (a retry) |
+| `400` | The bytes aren't the declared type, or the id is malformed |
+| `409` | The id already holds a different file |
+| `413` | Over `ATTACHMENT_MAX_BYTES` (10 MB). Scale photos down on the phone. |
+| `415` | Not one of the types above |
+
+Attachments are kept for 30 days, and the oldest go first past 500 MB in all. The reply
+outlives them: once one has gone, its entry stays in the reply and a download is a `404`.
+There's no route to read an attachment back through the inbox.
 
 ## Agent ← relay: `GET /replies`, `POST /replies/ack`
 
@@ -94,6 +123,12 @@ cursor, oldest first:
 { "replies": [{ "seq": 3, "id": "r_…", "messageId": "m_…", "thread": null, "title": null,
                 "choice": "Yes", "text": null, "sentAt": "…", "receivedAt": "…" }], "cursor": 2 }
 ```
+
+Each reply also carries `"attachments": [{"id": "a_…", "type": "audio/ogg", "bytes": 5004}]`,
+empty when there are none.
+
+`GET /attachments/<id>` returns the file, with its type as `Content-Type`, or `404` once
+it has expired. Transcribing a voice note is the agent's job; the relay only carries it.
 
 `POST /replies/ack {"upTo": 3}` moves the cursor and returns `{"cursor": 3}`. Acknowledge
 only after the agent has acted on a reply, so a crash in between re-delivers it instead of

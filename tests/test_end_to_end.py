@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -19,6 +20,8 @@ AGENT_IP = "100.64.0.7"
 STRANGER_IP = "100.64.0.99"
 PUSH_KEY = b"k" * 43
 REPLY_TOKEN = "t" * 43
+VOICE = b"OggS\x00\x02" + b"\x00" * 200
+PHOTO = b"\xff\xd8\xff\xe0" + b"\x01" * 300
 
 
 class FakePush(BaseHTTPRequestHandler):
@@ -83,6 +86,7 @@ class EndToEnd(unittest.TestCase):
         relay.RelayHandler.notify_limit = RateLimiter(100, 3600)
         relay.RelayHandler.outbox = relay.Outbox(outbox_db)
         relay.RelayHandler.inbox_db = f"{self.tmp.name}/inbox.db"
+        relay.RelayHandler.attachments_dir = inbox.InboxHandler.store.attachments_dir
         relay.RelayHandler.cursor = relay.Cursor(f"{self.tmp.name}/cursor.json")
         relay.RelayHandler.trusted_proxies = loopback
         self.relay, self.relay_url = start(relay.RelayHandler)
@@ -101,6 +105,21 @@ class EndToEnd(unittest.TestCase):
 
     def fetch(self, path, token=REPLY_TOKEN, via="203.0.113.5"):
         return request(self.inbox_url + path, headers={"Authorization": f"Bearer {token}"}, via=via)
+
+    def upload(self, attachment_id, data, content_type="audio/ogg", token=REPLY_TOKEN):
+        return request(self.inbox_url + f"/attachments/{attachment_id}", "PUT", data,
+                       {"Authorization": f"Bearer {token}", "Content-Type": content_type},
+                       via="203.0.113.5")
+
+    def download(self, attachment_id, via=AGENT_IP):
+        req = urllib.request.Request(self.relay_url + f"/attachments/{attachment_id}",
+                                     headers={"X-Forwarded-For": via})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, resp.headers.get_content_type(), resp.read()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, None, e.read()
 
     def notify(self, headline):
         status, body = request(self.relay_url + "/notify", "POST", {"headline": headline}, via=AGENT_IP)
@@ -272,7 +291,8 @@ class EndToEnd(unittest.TestCase):
         old.close()
         store = inbox.ReplyStore(path)
         try:
-            self.assertEqual(store.since(0, 10)[0]["thread"], None)
+            self.assertEqual((store.since(0, 10)[0]["thread"], store.since(0, 10)[0]["attachments"]),
+                             (None, []))
         finally:
             store.db.close()
 
@@ -299,9 +319,11 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.reply({"id": "r1", "text": "x"}, token="nope")[0], 401)
 
     def test_inbox_offers_nothing_else(self):
+        inbox.InboxHandler.per_ip = RateLimiter(100, 60)
         self.reply({"id": "r1", "text": "hello"})
         for method, path in (("GET", "/"), ("DELETE", "/replies"), ("POST", "/notify"),
-                             ("POST", "/messages"), ("GET", "/healthz")):
+                             ("POST", "/messages"), ("GET", "/healthz"),
+                             ("GET", "/attachments/a_0000000000000001")):
             status, _ = request(self.inbox_url + path, method,
                                 headers={"Authorization": f"Bearer {REPLY_TOKEN}"})
             self.assertEqual(status, 404, (method, path))
@@ -319,6 +341,82 @@ class EndToEnd(unittest.TestCase):
 
     def test_empty_reply_is_rejected(self):
         self.assertEqual(self.reply({"id": "r1", "text": "  "})[0], 400)
+
+    # attachments: voice notes and photos, phone -> agent
+
+    def test_voice_note_reaches_the_agent(self):
+        self.assertEqual(self.upload("a_0000000000000001", VOICE)[0], 201)
+        self.assertEqual(self.reply({"id": "r1", "messageId": "m_1",
+                                     "attachments": ["a_0000000000000001"]})[0], 202)
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
+        self.assertEqual((got["text"], got["choice"]), (None, None))
+        self.assertEqual(got["attachments"],
+                         [{"id": "a_0000000000000001", "type": "audio/ogg", "bytes": len(VOICE)}])
+        self.assertEqual(self.download("a_0000000000000001"), (200, "audio/ogg", VOICE))
+        # The tool sees the same thing when it rebuilds its history.
+        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["attachments"], got["attachments"])
+
+    def test_photo_with_text(self):
+        inbox.InboxHandler.per_ip = RateLimiter(100, 60)
+        self.upload("a_00000000000000a1", PHOTO, "image/jpeg")
+        self.upload("a_00000000000000a2", b"\x89PNG\r\n\x1a\n" + b"\x00" * 50, "image/png")
+        self.reply({"id": "r1", "text": "Which of these?",
+                    "attachments": ["a_00000000000000a1", "a_00000000000000a2"]})
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
+        self.assertEqual([a["type"] for a in got["attachments"]], ["image/jpeg", "image/png"])
+        self.assertEqual(self.download("a_00000000000000a1")[2], PHOTO)
+
+    def test_upload_must_be_what_it_says(self):
+        inbox.InboxHandler.per_ip = RateLimiter(100, 60)
+        self.assertEqual(self.upload("a_0000000000000001", PHOTO, "audio/ogg")[0], 400)
+        self.assertEqual(self.upload("a_0000000000000001", b"", "audio/ogg")[0], 400)
+        self.assertEqual(self.upload("a_0000000000000001", VOICE, "application/pdf")[0], 415)
+        self.assertEqual(self.upload("a_not_hex", VOICE)[0], 400)
+        self.assertEqual(self.upload("../../etc/passwd", VOICE)[0], 404)
+        self.assertEqual(self.upload("a_0000000000000001", VOICE, token="nope")[0], 401)
+        # Nothing was kept from any of those.
+        self.assertEqual(self.reply({"id": "r1", "attachments": ["a_0000000000000001"]})[0], 400)
+        self.assertEqual(os.listdir(inbox.InboxHandler.store.attachments_dir), [])
+
+    def test_upload_retries_are_stored_once(self):
+        self.assertEqual(self.upload("a_0000000000000001", VOICE)[0], 201)
+        self.assertEqual(self.upload("a_0000000000000001", VOICE)[0], 200)
+        self.assertEqual(self.upload("a_0000000000000001", VOICE + b"x")[0], 409)
+        self.assertEqual(self.download("a_0000000000000001")[2], VOICE)
+
+    def test_reply_needs_its_attachments_uploaded_first(self):
+        self.assertEqual(self.reply({"id": "r1", "attachments": ["a_00000000000000ff"]})[0], 400)
+        for bad in (["nope"], ["a_0000000000000001"] * 2, "a_0000000000000001"):
+            self.assertEqual(self.reply({"id": "r1", "text": "x", "attachments": bad})[0], 400, bad)
+
+    def test_upload_size_is_capped(self):
+        inbox.InboxHandler.max_attachment = 100
+        try:
+            self.assertEqual(self.upload("a_0000000000000001", VOICE)[0], 413)
+        finally:
+            inbox.InboxHandler.max_attachment = 10 << 20
+
+    def test_oldest_attachments_go_past_the_total(self):
+        inbox.InboxHandler.per_ip = RateLimiter(100, 60)
+        inbox.InboxHandler.store.attachment_total = len(VOICE) * 2
+        for i in range(3):
+            self.upload(f"a_000000000000000{i}", VOICE)
+        self.assertEqual(self.download("a_0000000000000000")[0], 404)
+        self.assertEqual(self.download("a_0000000000000002")[0], 200)
+        self.assertEqual(len(os.listdir(inbox.InboxHandler.store.attachments_dir)), 2)
+
+    def test_expired_attachment_is_gone(self):
+        self.upload("a_0000000000000001", VOICE)
+        store = inbox.InboxHandler.store
+        store.db.execute("UPDATE attachments SET received_at = '2000-01-01T00:00:00Z'")
+        store.attachment_days = 30
+        self.upload("a_0000000000000002", VOICE)
+        self.assertEqual(self.download("a_0000000000000001")[0], 404)
+
+    def test_stranger_cannot_download(self):
+        self.upload("a_0000000000000001", VOICE)
+        self.assertEqual(self.download("a_0000000000000001", via=STRANGER_IP)[0], 403)
+        self.assertEqual(self.download("a_bad")[0], 400)
 
 
 if __name__ == "__main__":

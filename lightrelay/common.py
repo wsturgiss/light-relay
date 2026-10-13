@@ -4,6 +4,8 @@ import ipaddress
 import json
 import logging
 import os
+import re
+import shutil
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,12 +13,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 log = logging.getLogger("lightrelay")
 
 # A reply as both the agent (via the relay) and the tool (via the inbox) read it.
-REPLY_COLUMNS = "seq, id, message_id, thread, title, choice, text, sent_at, received_at"
+REPLY_COLUMNS = "seq, id, message_id, thread, title, choice, text, sent_at, received_at, attachments"
+
+# A file the phone sent with a reply: a voice note or a photo. The phone names it.
+ATTACHMENT_ID_RE = re.compile(r"^a_[0-9a-f]{16}$")
+ATTACHMENT_COLUMNS = "id, type, bytes, sha256, received_at"
 
 
 def reply_from_row(r):
     return {"seq": r[0], "id": r[1], "messageId": r[2], "thread": r[3], "title": r[4],
-            "choice": r[5], "text": r[6], "sentAt": r[7], "receivedAt": r[8]}
+            "choice": r[5], "text": r[6], "sentAt": r[7], "receivedAt": r[8],
+            "attachments": json.loads(r[9]) if r[9] else []}
 
 
 def env(name, default=None, required=False):
@@ -122,6 +129,23 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(413, f"body over {self.max_body} bytes")
         return self.rfile.read(length)
 
+    def read_body_to(self, f, limit):
+        """Copy the body into `f` without holding it in memory. Returns its length."""
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            raise HttpError(411, "Content-Length required")
+        if length < 0 or length > limit:
+            raise HttpError(413, f"body over {limit} bytes")
+        left = length
+        while left:
+            chunk = self.rfile.read(min(left, 65536))
+            if not chunk:
+                raise HttpError(400, "body ended early")
+            f.write(chunk)
+            left -= len(chunk)
+        return length
+
     def read_json(self):
         try:
             data = json.loads(self.read_body())
@@ -139,6 +163,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def send_file(self, path, content_type, length):
+        with open(path, "rb") as f:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            shutil.copyfileobj(f, self.wfile)
 
     def send_error_json(self, status, message):
         # Don't keep a connection open for a client we just turned away.

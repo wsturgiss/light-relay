@@ -126,8 +126,10 @@ self-signed certificate the tool pins.
 ```
 
 → `200 {"session": "s1.<expiry>.<mac>", "expiresAt": "…"}`. A session token is
-`s1.<expiry in unix seconds>.<hex HMAC-SHA256(REPLY_TOKEN, "session:<expiry>")>`, so the
-inbox checks it without storing anything, and new keys end every session.
+`s1.<expiry in unix seconds>.<hex HMAC-SHA256(REPLY_TOKEN, "session:<expiry>")>`. New keys
+end every session. Each renewal retires every session issued more than 10 minutes before
+it: the inbox keeps only the newest session's expiry (`session-newest.json`), so a pairing
+is for one phone.
 
 | Status | Meaning |
 |---|---|

@@ -164,8 +164,9 @@ your own devices reach the relay's node.
 - **Reply token:** an attacker can show the agent fake replies and read the last 90 days of
   the conversation. They can't put a message on the phone, because that takes the push key,
   which the inbox never has. With sessions on, the reply token works only on your LAN.
-- **Session token** (sessions on): the same as the reply token, until it expires
-  (`SESSION_TTL_HOURS`).
+- **Session token** (sessions on): the same as the reply token, until the phone next
+  renews at home (every 3 hours there), or until it expires (`SESSION_TTL_HOURS`) if the
+  phone is away.
 
 **Short-lived sessions.** By default the reply token never expires: a lost phone keeps
 working until you tap **New keys**. Set `SESSION_HOST` to this host's LAN IP, and the public

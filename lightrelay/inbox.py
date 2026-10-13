@@ -273,6 +273,7 @@ class InboxHandler(Handler):
     # With sessions on, the reply token itself stays off the public door.
     accept_reply_token = True
     session_ttl = 72 * 3600
+    newest = None
     max_attachment = 10 << 20
     per_ip = None
     overall = None
@@ -283,7 +284,8 @@ class InboxHandler(Handler):
             return False
         bearer = auth[7:].strip()
         if bearer.startswith(session.PREFIX + "."):
-            return session.valid(bearer, self.token, self.session_ttl)
+            return session.valid(bearer, self.token, self.session_ttl,
+                                 newest=self.newest.value if self.newest else 0)
         return self.accept_reply_token and hmac.compare_digest(bearer.encode(), self.token)
 
     def route(self, method):
@@ -350,6 +352,7 @@ class SessionHandler(Handler):
     session_ttl = 72 * 3600
     limit = None
     nonces = None
+    newest = None
 
     def route(self, method):
         ip = self.client_ip()
@@ -371,6 +374,8 @@ class SessionHandler(Handler):
         if not self.nonces.fresh(nonce):
             raise HttpError(401, "nonce already used")
         token, expires = session.issue(self.token, self.session_ttl)
+        # This one retires every session before it.
+        self.newest.set(expires)
         log.info("session for %s until %s", ip, datetime.fromtimestamp(expires, timezone.utc).isoformat())
         self.send_json(200, {"session": token,
                              "expiresAt": datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
@@ -414,6 +419,7 @@ def main():
         SessionHandler.token = token.encode()
         SessionHandler.limit = RateLimiter(env_int("SESSION_RATE_PER_MIN", 10), 60)
         SessionHandler.nonces = session.Nonces()
+        InboxHandler.newest = SessionHandler.newest = session.Newest(f"{data_dir}/session-newest.json")
         sessions = serve_sessions(session_host, env_int("SESSION_PORT", 18443),
                                   env("SESSION_CERT", "/session/cert.pem"), env("SESSION_KEY", "/session/key.pem"))
         threading.Thread(target=sessions.serve_forever, daemon=True).start()

@@ -37,6 +37,23 @@ class Tokens(unittest.TestCase):
         token, _ = session.issue(SECRET, 30 * 86400, now=1000)
         self.assertFalse(session.valid(token, SECRET, 72 * 3600, now=1001))
 
+    def test_a_newer_session_retires_older_ones_after_the_grace(self):
+        old, _ = session.issue(SECRET, 3600, now=1000)
+        recent, _ = session.issue(SECRET, 3600, now=1500)
+        _, newest = session.issue(SECRET, 3600, now=1800)
+        # Issued 800s before the newest: past the 600s grace.
+        self.assertFalse(session.valid(old, SECRET, 3600, now=1801, newest=newest))
+        # Issued 300s before it: still in flight, still good.
+        self.assertTrue(session.valid(recent, SECRET, 3600, now=1801, newest=newest))
+        # The newest itself, and anything when nothing's been issued.
+        self.assertTrue(session.valid(old, SECRET, 3600, now=1801, newest=0))
+
+    def test_the_newest_expiry_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session.Newest(f"{tmp}/n.json").set(4242)
+            self.assertEqual(session.Newest(f"{tmp}/n.json").value, 4242)
+            self.assertEqual(session.Newest(f"{tmp}/missing.json").value, 0)
+
     def test_nonces_are_single_use(self):
         nonces = session.Nonces()
         self.assertTrue(nonces.fresh("ab" * 16, now=1000))
@@ -74,6 +91,7 @@ class Renewal(unittest.TestCase):
         inbox.SessionHandler.session_ttl = 72 * 3600
         inbox.SessionHandler.limit = RateLimiter(100, 60)
         inbox.SessionHandler.nonces = session.Nonces()
+        inbox.SessionHandler.newest = session.Newest(f"{self.tmp.name}/session-newest.json")
         self.lan = inbox.serve_sessions("127.0.0.1", 0, cert, key)
         threading.Thread(target=self.lan.serve_forever, daemon=True).start()
         self.lan_url = f"https://127.0.0.1:{self.lan.server_address[1]}"
@@ -83,6 +101,7 @@ class Renewal(unittest.TestCase):
         inbox.InboxHandler.token = SECRET
         inbox.InboxHandler.accept_reply_token = False
         inbox.InboxHandler.session_ttl = 72 * 3600
+        inbox.InboxHandler.newest = inbox.SessionHandler.newest
         inbox.InboxHandler.per_ip = RateLimiter(100, 60)
         inbox.InboxHandler.overall = RateLimiter(1000, 60)
         self.public = serve(inbox.InboxHandler, "127.0.0.1", 0)
@@ -95,6 +114,7 @@ class Renewal(unittest.TestCase):
             s.server_close()
         inbox.InboxHandler.store.db.close()
         inbox.InboxHandler.accept_reply_token = True
+        inbox.InboxHandler.newest = None
         self.tmp.cleanup()
 
     def renew(self, secret=SECRET, at=None, nonce=None):
@@ -116,6 +136,20 @@ class Renewal(unittest.TestCase):
         # Until it's told to, while the phone moves over.
         inbox.InboxHandler.accept_reply_token = True
         self.assertEqual(request(self.public_url + "/messages", token=SECRET.decode())[0], 200)
+
+    def test_renewing_retires_the_last_session(self):
+        # A session from an hour ago: a leaked one, say.
+        leaked, _ = session.issue(SECRET, 72 * 3600, now=time.time() - 3600)
+        self.assertEqual(request(self.public_url + "/messages", token=leaked)[0], 200)
+        fresh = self.renew()[1]["session"]
+        self.assertEqual(request(self.public_url + "/messages", token=leaked)[0], 401)
+        self.assertEqual(request(self.public_url + "/messages", token=fresh)[0], 200)
+
+    def test_a_session_from_moments_ago_survives_a_renewal(self):
+        first = self.renew()[1]["session"]
+        self.renew()
+        # Within the grace: a request already in flight with it still lands.
+        self.assertEqual(request(self.public_url + "/messages", token=first)[0], 200)
 
     def test_new_keys_end_every_session(self):
         token = self.renew()[1]["session"]

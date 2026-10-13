@@ -172,28 +172,41 @@ class Outbox:
 
 
 class Cursor:
-    """How far through the inbox the agent has acknowledged. Lives in the
-    relay's own data dir: the inbox database is mounted read-only here."""
+    """How far through the inbox each agent has acknowledged, by tailnet IP. Every
+    agent sees every reply and acknowledges only for itself, so one that is
+    rarely running never holds back another. Lives in the relay's own data dir:
+    the inbox database is mounted read-only here.
+
+    The file is `{"seq": n, "agents": {"<ip>": n}}`. `seq` is the one position
+    shared before agents had their own; an agent that hasn't acknowledged
+    anything yet starts there, so the switch re-delivers nothing.
+    """
 
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
 
-    def get(self):
+    def _load(self):
         try:
             with open(self.path) as f:
-                return int(json.load(f)["seq"])
-        except (FileNotFoundError, ValueError, KeyError):
-            return 0
+                data = json.load(f)
+            return int(data.get("seq", 0)), {k: int(v) for k, v in data.get("agents", {}).items()}
+        except (FileNotFoundError, ValueError, KeyError, AttributeError):
+            return 0, {}
 
-    def advance(self, seq):
+    def get(self, agent):
+        shared, agents = self._load()
+        return agents.get(agent, shared)
+
+    def advance(self, agent, seq):
         with self.lock:
-            seq = max(seq, self.get())
+            shared, agents = self._load()
+            agents[agent] = max(seq, agents.get(agent, shared))
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"seq": seq}, f)
+                json.dump({"seq": shared, "agents": agents}, f)
             os.replace(tmp, self.path)
-            return seq
+            return agents[agent]
 
 
 def read_inbox(db_path, sql, args):
@@ -249,9 +262,9 @@ class RelayHandler(Handler):
         if method == "POST" and url.path == "/notify":
             return self.notify()
         if method == "GET" and url.path == "/replies":
-            return self.replies(parse_qs(url.query))
+            return self.replies(str(ip), parse_qs(url.query))
         if method == "POST" and url.path == "/replies/ack":
-            return self.ack()
+            return self.ack(str(ip))
         if method == "GET" and url.path.startswith("/attachments/"):
             return self.attachment(url.path[len("/attachments/"):])
         raise HttpError(404, "not found")
@@ -296,14 +309,14 @@ class RelayHandler(Handler):
             return False
         return True
 
-    def replies(self, query):
+    def replies(self, agent, query):
         try:
             limit = min(max(int(query.get("limit", ["50"])[0]), 1), 200)
-            after = int(query["after"][0]) if "after" in query else self.cursor.get()
+            after = int(query["after"][0]) if "after" in query else self.cursor.get(agent)
         except ValueError:
             raise HttpError(400, "after and limit must be integers")
         rows = read_replies(self.inbox_db, after, limit)
-        self.send_json(200, {"replies": rows, "cursor": self.cursor.get()})
+        self.send_json(200, {"replies": rows, "cursor": self.cursor.get(agent)})
 
     def attachment(self, attachment_id):
         if not ATTACHMENT_ID_RE.match(attachment_id):
@@ -318,12 +331,12 @@ class RelayHandler(Handler):
             # Pruned between the lookup and the open.
             raise HttpError(404, "no such attachment; it may have expired")
 
-    def ack(self):
+    def ack(self, agent):
         data = self.read_json()
         up_to = data.get("upTo")
         if not isinstance(up_to, int) or isinstance(up_to, bool) or up_to < 0:
             raise HttpError(400, "upTo must be a non-negative integer (a reply's seq)")
-        self.send_json(200, {"cursor": self.cursor.advance(up_to)})
+        self.send_json(200, {"cursor": self.cursor.advance(agent, up_to)})
 
 
 def main():

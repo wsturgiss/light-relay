@@ -82,6 +82,9 @@ reply, with no `text`.
 - **Act first, then `ack`.** Anything not acknowledged comes back next time, so a crash
   between the two can't lose a reply. Don't `ack` past a reply you haven't handled, and
   don't use `replies --ack`, which acknowledges everything it prints.
+- **Other agents may use the same relay.** You see replies to their messages too. Skip
+  any whose `messageId` or `thread` isn't one you sent, and `ack` past them freely: your
+  acknowledgements move only your own position, never theirs.
 - A reply can arrive minutes or hours later. Check on a schedule.
 
 ## Things not to do

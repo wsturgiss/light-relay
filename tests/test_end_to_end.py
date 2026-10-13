@@ -18,6 +18,7 @@ from lightrelay import inbox, relay, transcribe
 from lightrelay.common import RateLimiter, serve
 
 AGENT_IP = "100.64.0.7"
+OTHER_AGENT_IP = "100.64.0.8"
 STRANGER_IP = "100.64.0.99"
 PUSH_KEY = b"k" * 43
 REPLY_TOKEN = "t" * 43
@@ -102,7 +103,7 @@ class EndToEnd(unittest.TestCase):
         inbox.InboxHandler.trusted_proxies = loopback
         self.inbox, self.inbox_url = start(inbox.InboxHandler)
 
-        relay.RelayHandler.allowed_peers = frozenset({ipaddress.ip_address(AGENT_IP)})
+        relay.RelayHandler.allowed_peers = frozenset(map(ipaddress.ip_address, (AGENT_IP, OTHER_AGENT_IP)))
         relay.RelayHandler.push_endpoint = push_url + "/push/abc"
         relay.RelayHandler.push_key = PUSH_KEY
         relay.RelayHandler.notify_limit = RateLimiter(100, 3600)
@@ -282,6 +283,28 @@ class EndToEnd(unittest.TestCase):
         last = body["replies"][-1]["seq"]
         self.assertEqual(request(self.relay_url + "/replies/ack", "POST", {"upTo": last}, via=AGENT_IP)[0], 200)
         self.assertEqual(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"], [])
+
+    def test_each_agent_acknowledges_only_for_itself(self):
+        self.reply({"id": "r1", "messageId": "m_1", "choice": "Yes"})
+        self.reply({"id": "r2", "messageId": "m_2", "choice": "No"})
+        ack = lambda seq, via: request(self.relay_url + "/replies/ack", "POST", {"upTo": seq}, via=via)[1]
+        ids = lambda via: [r["id"] for r in request(self.relay_url + "/replies", via=via)[1]["replies"]]
+        self.assertEqual(ack(2, AGENT_IP), {"cursor": 2})
+        self.assertEqual(ids(AGENT_IP), [])
+        # The other agent still has both, and its own position.
+        self.assertEqual(ids(OTHER_AGENT_IP), ["r1", "r2"])
+        self.assertEqual(ack(1, OTHER_AGENT_IP), {"cursor": 1})
+        self.assertEqual(ids(OTHER_AGENT_IP), ["r2"])
+        self.assertEqual(ids(AGENT_IP), [])
+
+    def test_agents_start_from_the_shared_position(self):
+        # A cursor file from before agents had their own.
+        with open(relay.RelayHandler.cursor.path, "w") as f:
+            json.dump({"seq": 1}, f)
+        self.reply({"id": "r1", "messageId": "m_1", "choice": "Yes"})
+        self.reply({"id": "r2", "messageId": "m_2", "choice": "No"})
+        for via in (AGENT_IP, OTHER_AGENT_IP):
+            self.assertEqual([r["id"] for r in request(self.relay_url + "/replies", via=via)[1]["replies"]], ["r2"])
 
     def test_conversation_started_on_the_phone_reaches_the_agent_and_back(self):
         start = {"id": "r_start", "thread": "t_0123456789abcdef", "title": "Plan Saturday",

@@ -319,6 +319,32 @@ class EndToEnd(unittest.TestCase):
         # The phone can read its own start back to rebuild the conversation.
         self.assertEqual(self.fetch("/replies")[1]["replies"][0]["title"], "Plan Saturday")
 
+    def test_conversation_from_the_phone_names_its_agent(self):
+        inbox.InboxHandler.agents = ("Huginn", "Claude")
+        self.addCleanup(setattr, inbox.InboxHandler, "agents", ())
+        self.assertEqual(self.fetch("/agents")[1], {"agents": ["Huginn", "Claude"]})
+        start = {"id": "r_start", "thread": "t_0123456789abcdef", "title": "Plan Saturday",
+                 "text": "Plan Saturday", "to": "claude"}
+        self.assertEqual(self.reply(start)[0], 202)
+        # Spelled as configured, for the agent and for the phone's history.
+        self.assertEqual(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]["to"], "Claude")
+        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["to"], "Claude")
+        # Only a conversation started on the phone has a recipient; an answer to a message doesn't.
+        self.assertEqual(self.reply({"id": "r2", "messageId": "m_1", "text": "x", "to": "Claude"})[0], 400)
+        self.assertEqual(self.reply({"id": "r3", "thread": "t_0123456789abcdef", "text": "x", "to": "<b>"})[0], 400)
+
+    def test_replies_without_a_recipient_say_so(self):
+        self.reply({"id": "r1", "messageId": "m_1", "choice": "Yes"})
+        self.assertIsNone(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]["to"])
+        self.assertEqual(self.fetch("/agents")[1], {"agents": []})
+
+    def test_agents_setting(self):
+        self.assertEqual(inbox.parse_agents(" Huginn, Claude "), ["Huginn", "Claude"])
+        self.assertEqual(inbox.parse_agents(None), [])
+        for bad in ("Huginn,huginn", "a/b", "x" * 25):
+            with self.assertRaises(SystemExit):
+                inbox.parse_agents(bad)
+
     def test_bad_thread_or_title_is_rejected(self):
         for body in ({"id": "r1", "text": "x", "thread": "m_0123456789abcdef"},
                      {"id": "r1", "text": "x", "title": "no thread"},

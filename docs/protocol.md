@@ -69,6 +69,12 @@ own position, and reads change nothing on the server.
 
 Messages and replies are kept for 90 days, up to 5000 rows each.
 
+### `GET /agents`
+
+`{"agents": ["Huginn", "Claude"]}`: the inbox's `AGENTS` setting, the default first. The
+tool offers these under **To** when you start a conversation; with fewer than two it
+doesn't ask. Empty when `AGENTS` isn't set.
+
 ### `GET /transcripts`
 
 Voice notes' text, when the inbox transcribes them (`TRANSCRIBE_API_KEY`). Same paging:
@@ -94,6 +100,10 @@ Body ≤ 4 KB. Two forms:
 - The second form starts a conversation from the phone. It has no `messageId`; `thread`
   (`t_` and 16 hex digits) is the new conversation's id, and `title` (≤ 120 characters)
   is its first line. The agent answers with `notify` and that `thread`.
+- The second form can carry `"to": "Huginn"`: which agent the conversation is for, picked
+  on the phone from `GET /agents`. It's on every reply in the conversation until an agent
+  answers; after that, `messageId` says whose it is. A name in `AGENTS` comes back spelled
+  as configured. Without `to`, the conversation is unaddressed.
 - Either form can carry `"attachments": ["a_…"]`: up to 4 voice notes or photos,
   uploaded first. A reply with attachments needs no `choice` or `text`. Naming one that
   hasn't been uploaded is a `400`, so upload it and send the reply again.

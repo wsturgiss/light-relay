@@ -140,6 +140,7 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `ATTACHMENT_MAX_BYTES` | inbox | `10485760` | Bytes per voice note or photo |
 | `ATTACHMENT_MAX_TOTAL` | inbox | `524288000` | Bytes kept in all; the oldest go first |
 | `ATTACHMENT_RETAIN_DAYS` | inbox | `30` | Shorter than the 90 days replies are kept |
+| `AGENTS` | inbox | | Names, comma-separated, the default first, e.g. `Huginn,Claude`. The phone asks which one a new conversation is for. |
 | `TRANSCRIBE_API_KEY` | inbox | | Turns on voice-note transcripts (see **Voice transcripts**). An OpenAI key by default. |
 | `TRANSCRIBE_URL` | inbox | `https://api.openai.com/v1/audio/transcriptions` | Any OpenAI-compatible endpoint, e.g. Groq's `https://api.groq.com/openai/v1/audio/transcriptions` |
 | `TRANSCRIBE_MODEL` | inbox | `gpt-4o-mini-transcribe` | `whisper-large-v3-turbo` on Groq |

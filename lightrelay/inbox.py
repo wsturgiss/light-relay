@@ -39,6 +39,8 @@ MAX_TITLE = 120
 # A conversation started on the phone. The agent continues it with notify's `thread`.
 THREAD_RE = re.compile(r"^t_[0-9a-f]{16}$")
 MAX_ATTACHMENTS = 4
+MAX_AGENTS = 8
+AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,24}$")
 
 
 def _is_mp4(head):
@@ -105,7 +107,8 @@ class ReplyStore:
         # Added with conversations started on the phone; older databases lack them.
         have = {row[1] for row in self.db.execute("PRAGMA table_info(replies)")}
         # attachments: added with voice notes and photos.
-        for column in ("thread", "title", "attachments"):
+        # to_agent: added with choosing who a conversation is for.
+        for column in ("thread", "title", "attachments", "to_agent"):
             if column not in have:
                 self.db.execute(f"ALTER TABLE replies ADD COLUMN {column} TEXT")
         if "error" not in {row[1] for row in self.db.execute("PRAGMA table_info(transcripts)")}:
@@ -209,11 +212,11 @@ class ReplyStore:
         with self.lock:
             cur = self.db.execute(
                 "INSERT OR IGNORE INTO replies"
-                " (id, message_id, thread, title, choice, text, sent_at, received_at, attachments)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " (id, message_id, thread, title, choice, text, sent_at, received_at, attachments, to_agent)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (reply["id"], reply.get("messageId"), reply.get("thread"), reply.get("title"),
                  reply.get("choice"), reply.get("text"), reply.get("sentAt"), now_iso(),
-                 json.dumps(reply["attachments"]) if reply.get("attachments") else None),
+                 json.dumps(reply["attachments"]) if reply.get("attachments") else None, reply.get("to")),
             )
             self._prune()
             return cur.rowcount == 1
@@ -240,7 +243,16 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def validate(data, store):
+def parse_agents(value):
+    """`AGENTS`: the names the phone offers under To, the default first."""
+    names = [n.strip() for n in (value or "").split(",") if n.strip()]
+    bad = [n for n in names if not AGENT_NAME_RE.match(n)]
+    if bad or len(names) > MAX_AGENTS or len({n.lower() for n in names}) != len(names):
+        raise SystemExit(f"AGENTS must be up to {MAX_AGENTS} distinct names of [A-Za-z0-9 ._-], at most 24 chars each")
+    return names
+
+
+def validate(data, store, agents=()):
     reply_id = data.get("id")
     if not isinstance(reply_id, str) or not ID_RE.match(reply_id):
         raise HttpError(400, "id must be 1-64 of [A-Za-z0-9_-]")
@@ -277,9 +289,17 @@ def validate(data, store):
         raise HttpError(400, f"title must be a string of at most {MAX_TITLE} chars")
     if title and not thread:
         raise HttpError(400, "a title starts a conversation, so it needs a thread")
+    to = data.get("to")
+    if to is not None:
+        if not isinstance(to, str) or not thread or message_id:
+            raise HttpError(400, "to names who a conversation started on the phone is for, so it needs a thread")
+        # One of AGENTS, spelled as configured. A name since removed is kept as sent.
+        to = next((a for a in agents if a.lower() == to.lower()), to)
+        if not AGENT_NAME_RE.match(to):
+            raise HttpError(400, "to must be an agent's name")
     return {"id": reply_id, "messageId": message_id, "thread": thread, "title": title or None,
             "choice": choice or None, "text": text or None, "sentAt": sent_at,
-            "attachments": attachments}
+            "attachments": attachments, "to": to}
 
 
 def read_messages(db_path, after, limit):
@@ -322,6 +342,7 @@ class InboxHandler(Handler):
     per_ip = None
     overall = None
     transcriber = None
+    agents = ()
 
     def authorized(self):
         auth = self.headers.get("Authorization", "")
@@ -350,6 +371,8 @@ class InboxHandler(Handler):
             handler = self.get_replies
         elif (method, url.path) == ("GET", "/transcripts"):
             handler = self.get_transcripts
+        elif (method, url.path) == ("GET", "/agents"):
+            handler = lambda ip, _query: self.send_json(200, {"agents": list(self.agents)})
         else:
             raise HttpError(404, "not found")
         # Reject before reading a byte of the body.
@@ -372,7 +395,7 @@ class InboxHandler(Handler):
         self.send_json(201 if stored else 200, {"ok": True})
 
     def post_reply(self, ip, _query):
-        reply = validate(self.read_json(), self.store)
+        reply = validate(self.read_json(), self.store, self.agents)
         stored = self.store.add(reply)
         log.info("reply %s from %s (%s)", reply["id"], ip, "stored" if stored else "duplicate")
         self.send_json(202, {"ok": True})
@@ -463,6 +486,10 @@ def main():
     InboxHandler.client_ip_header = env("CLIENT_IP_HEADER", "X-Forwarded-For")
     InboxHandler.max_body = env_int("INBOX_MAX_BODY", 4096)
     InboxHandler.max_attachment = env_int("ATTACHMENT_MAX_BYTES", 10 << 20)
+
+    InboxHandler.agents = tuple(parse_agents(env("AGENTS")))
+    if InboxHandler.agents:
+        log.info("conversations from the phone can go to %s", ", ".join(InboxHandler.agents))
 
     api_key = env("TRANSCRIBE_API_KEY")
     if api_key:

@@ -43,6 +43,9 @@ conversation is one row in the inbox and one screen when the user opens it.
 - **The user can start a conversation too.** It arrives in `replies` with no
   `messageId`, a `thread` (`t_…`) and a `title` (their first line). Answer with
   `--thread <that thread>`, and keep using it for the rest of the conversation.
+- **Check `to` on a conversation the user started.** It names the agent they picked
+  (the relay's `AGENTS`). Take only the ones addressed to you. With no `to` (an older
+  phone, or `AGENTS` unset), agree with the other agents who takes them.
 - **New subject? Leave `--thread` off.**
 - Don't open a new conversation for a follow-up. It shows up on the phone as an
   unrelated message.

@@ -136,7 +136,10 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `REPLY_TOKEN` | inbox | *(required)* | From the Pairing screen. The first run writes a temporary one. |
 | `INBOX_RATE_PER_MIN` | inbox | `20` | Per client IP, rejected requests included |
 | `INBOX_RATE_TOTAL_PER_MIN` | inbox | `120` | Across all clients |
-| `INBOX_MAX_BODY` | inbox | `4096` | Bytes |
+| `INBOX_MAX_BODY` | inbox | `4096` | Bytes, for JSON bodies |
+| `ATTACHMENT_MAX_BYTES` | inbox | `10485760` | Bytes per voice note or photo |
+| `ATTACHMENT_MAX_TOTAL` | inbox | `524288000` | Bytes kept in all; the oldest go first |
+| `ATTACHMENT_RETAIN_DAYS` | inbox | `30` | Shorter than the 90 days replies are kept |
 | `TRUSTED_PROXIES` | both | `127.0.0.1,::1` | Peers whose `CLIENT_IP_HEADER` is believed |
 | `CLIENT_IP_HEADER` | both | `X-Forwarded-For` | |
 | `LOG_LEVEL` | both | `INFO` | |

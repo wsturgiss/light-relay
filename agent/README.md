@@ -29,6 +29,7 @@ reachable. Every message interrupts them.
 | Continue one | `relayctl.py notify "<headline>" "<detail>" --thread <message id>` |
 | Unhandled replies | `relayctl.py replies` |
 | Mark replies handled | `relayctl.py ack <seq>` (everything up to and including `seq`) |
+| Save a voice note or photo | `relayctl.py attachment <id> [-o <path>]` |
 
 `notify` prints `{"id": "m_…", "at": "…", "thread": "m_…", "pushed": true|false}`. Keep the `id`.
 
@@ -61,7 +62,21 @@ conversation is one row in the inbox and one screen when the user opens it.
 - No `messageId` but a `thread`: the user started a conversation (see
   **Conversations**), or added to it before you answered. Once you've answered, their
   replies carry your message's id as `messageId`, like any other reply.
-- A reply has a tapped `choice` or typed `text`, sometimes both.
+- A reply has a tapped `choice`, typed `text` or `attachments`, sometimes several.
+
+## Voice notes and photos
+
+A reply's `attachments` lists what the user recorded or photographed:
+`[{"id": "a_…", "type": "audio/ogg", "bytes": 48213}]`. A voice note can be the whole
+reply, with no `text`.
+
+- `relayctl.py attachment <id>` saves it here as `<id>.ogg`, `.jpg` and so on, and prints
+  `{"path", "type", "bytes"}`.
+- **Voice notes:** transcribe it, and treat the transcript as the reply's text. If you
+  can't, tell the user you got a voice note you couldn't listen to; don't guess.
+- **Photos:** look at it. Answer about what's in it, in the same thread.
+- Fetch them when the reply arrives. They're kept 30 days, then `attachment` fails with
+  a `404`.
 - **Act first, then `ack`.** Anything not acknowledged comes back next time, so a crash
   between the two can't lose a reply. Don't `ack` past a reply you haven't handled, and
   don't use `replies --ack`, which acknowledges everything it prints.

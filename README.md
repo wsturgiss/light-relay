@@ -140,6 +140,10 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `ATTACHMENT_MAX_BYTES` | inbox | `10485760` | Bytes per voice note or photo |
 | `ATTACHMENT_MAX_TOTAL` | inbox | `524288000` | Bytes kept in all; the oldest go first |
 | `ATTACHMENT_RETAIN_DAYS` | inbox | `30` | Shorter than the 90 days replies are kept |
+| `SESSION_HOST` | inbox | | This host's LAN IP. Turns on short-lived sessions (see **Security**). |
+| `SESSION_PORT` | inbox | `18443` | The LAN-only session door |
+| `SESSION_TTL_HOURS` | inbox | `72` | How long a session lasts away from home |
+| `ACCEPT_REPLY_TOKEN` | inbox | `0` with sessions, `1` without | `1` lets the reply token itself through Funnel, while the phone moves over |
 | `TRUSTED_PROXIES` | both | `127.0.0.1,::1` | Peers whose `CLIENT_IP_HEADER` is believed |
 | `CLIENT_IP_HEADER` | both | `X-Forwarded-For` | |
 | `LOG_LEVEL` | both | `INFO` | |
@@ -159,7 +163,20 @@ your own devices reach the relay's node.
 - **Push endpoint only:** nothing. The tool drops any message without a valid signature.
 - **Reply token:** an attacker can show the agent fake replies and read the last 90 days of
   the conversation. They can't put a message on the phone, because that takes the push key,
-  which the inbox never has.
+  which the inbox never has. With sessions on, the reply token works only on your LAN.
+- **Session token** (sessions on): the same as the reply token, until the phone next
+  renews at home (every 3 hours there), or until it expires (`SESSION_TTL_HOURS`) if the
+  phone is away.
+
+**Short-lived sessions.** By default the reply token never expires: a lost phone keeps
+working until you tap **New keys**. Set `SESSION_HOST` to this host's LAN IP, and the public
+inbox stops taking the reply token. Instead, the phone trades it for a session on your LAN,
+renewing whenever it's home, and a lost phone stops working by itself within
+`SESSION_TTL_HOURS`. The session door is HTTPS on the LAN address with a self-signed
+certificate that `up.sh` makes; the tool pins it (`relay.sessionPin`, printed by `up.sh`). The
+phone proves it holds the reply token without sending it. Open the port on the host's
+firewall to the LAN only, never to the internet. While the phone moves over, set
+`ACCEPT_REPLY_TOKEN=1`; remove it once Pairing shows a session.
 - **No token:** the inbox answers `401` before reading the body, and rate limits cap the
   load. Funnel has no DDoS protection.
 

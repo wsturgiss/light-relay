@@ -114,6 +114,29 @@ Attachments are kept for 30 days, and the oldest go first past 500 MB in all. Th
 outlives them: once one has gone, its entry stays in the reply and a download is a `404`.
 There's no route to read an attachment back through the inbox.
 
+### Sessions: `POST /session`, on the LAN
+
+With `SESSION_HOST` set, the inbox routes above take a **session token** as the bearer,
+and the reply token itself is refused (unless `ACCEPT_REPLY_TOKEN=1`). The phone gets a
+session from a second, LAN-only door: `https://<SESSION_HOST>:18443/session`, with a
+self-signed certificate the tool pins.
+
+```json
+{ "at": 1791900000, "nonce": "<32-64 hex digits>", "proof": "<hex HMAC-SHA256(REPLY_TOKEN, \"renew:<at>:<nonce>\")>" }
+```
+
+→ `200 {"session": "s1.<expiry>.<mac>", "expiresAt": "…"}`. A session token is
+`s1.<expiry in unix seconds>.<hex HMAC-SHA256(REPLY_TOKEN, "session:<expiry>")>`. New keys
+end every session. Each renewal retires every session issued more than 10 minutes before
+it: the inbox keeps only the newest session's expiry (`session-newest.json`), so a pairing
+is for one phone.
+
+| Status | Meaning |
+|---|---|
+| `400` | `at` is more than 5 minutes from the inbox's clock, or the body is malformed |
+| `401` | The proof doesn't verify, or the nonce was already used |
+| `429` | Over `SESSION_RATE_PER_MIN` (10) |
+
 ## Agent ← relay: `GET /replies`, `POST /replies/ack`
 
 `GET /replies[?limit=<n ≤ 200>][&after=<seq>]` returns replies after the acknowledged

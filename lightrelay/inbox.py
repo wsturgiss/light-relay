@@ -5,7 +5,8 @@ accepts replies (POST /replies) and the voice notes and photos they carry
 (PUT /attachments/<id>), and it hands back the conversation so far
 (GET /messages: the relay's signed messages, GET /replies: the replies stored
 here), so the tool can fetch messages without a push endpoint and rebuild its
-history. Nothing can be deleted through it, and it has no route to the
+history. With sessions on (SESSION_HOST), it takes only short-lived session
+tokens, which the phone renews on the LAN; see session.py. Nothing can be deleted through it, and it has no route to the
 phone-pushing path. It reads the relay's outbox through a read-only mount,
 and the relay reads the reply database it writes the same way.
 """
@@ -18,11 +19,13 @@ import os
 import re
 import secrets
 import sqlite3
+import ssl
 import threading
 import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
+from . import session
 from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, env,
                      env_int, log, parse_ips, reply_from_row, serve, setup_logging)
 
@@ -267,9 +270,23 @@ class InboxHandler(Handler):
     store = None
     outbox_db = None
     token = b""
+    # With sessions on, the reply token itself stays off the public door.
+    accept_reply_token = True
+    session_ttl = 72 * 3600
+    newest = None
     max_attachment = 10 << 20
     per_ip = None
     overall = None
+
+    def authorized(self):
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return False
+        bearer = auth[7:].strip()
+        if bearer.startswith(session.PREFIX + "."):
+            return session.valid(bearer, self.token, self.session_ttl,
+                                 newest=self.newest.value if self.newest else 0)
+        return self.accept_reply_token and hmac.compare_digest(bearer.encode(), self.token)
 
     def route(self, method):
         ip = self.client_ip()
@@ -289,8 +306,7 @@ class InboxHandler(Handler):
         else:
             raise HttpError(404, "not found")
         # Reject before reading a byte of the body.
-        auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:].strip().encode(), self.token):
+        if not self.authorized():
             raise HttpError(401, "unauthorized")
         handler(ip, parse_qs(url.query))
 
@@ -325,6 +341,55 @@ class InboxHandler(Handler):
         self.send_json(200, {"replies": replies})
 
 
+class SessionHandler(Handler):
+    """The LAN-only door: trades proof of the reply token for a session token.
+
+    Served over HTTPS on the LAN address, never through Funnel. The phone pins
+    its certificate, and proves it holds the reply token without sending it.
+    """
+
+    token = b""
+    session_ttl = 72 * 3600
+    limit = None
+    nonces = None
+    newest = None
+
+    def route(self, method):
+        ip = self.client_ip()
+        if not self.limit.allow(ip):
+            raise HttpError(429, "slow down")
+        if (method, urlsplit(self.path).path) != ("POST", "/session"):
+            raise HttpError(404, "not found")
+        data = self.read_json()
+        at, nonce, proof = data.get("at"), data.get("nonce"), data.get("proof")
+        if not isinstance(at, int) or isinstance(at, bool) or not isinstance(nonce, str) or not isinstance(proof, str):
+            raise HttpError(400, "send at (unix seconds), nonce and proof")
+        if abs(time.time() - at) > session.CLOCK_SKEW:
+            raise HttpError(400, "clock is too far off")
+        if not session.NONCE_RE.match(nonce):
+            raise HttpError(400, "nonce must be 32-64 hex digits")
+        if not hmac.compare_digest(proof, session.proof(self.token, at, nonce)):
+            log.warning("session refused from %s: bad proof", ip)
+            raise HttpError(401, "unauthorized")
+        if not self.nonces.fresh(nonce):
+            raise HttpError(401, "nonce already used")
+        token, expires = session.issue(self.token, self.session_ttl)
+        # This one retires every session before it.
+        self.newest.set(expires)
+        log.info("session for %s until %s", ip, datetime.fromtimestamp(expires, timezone.utc).isoformat())
+        self.send_json(200, {"session": token,
+                             "expiresAt": datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+
+
+def serve_sessions(host, port, cert, key):
+    server = serve(SessionHandler, host, port)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    return server
+
+
 def main():
     setup_logging()
     token = env("REPLY_TOKEN", required=True)
@@ -343,6 +408,24 @@ def main():
     InboxHandler.client_ip_header = env("CLIENT_IP_HEADER", "X-Forwarded-For")
     InboxHandler.max_body = env_int("INBOX_MAX_BODY", 4096)
     InboxHandler.max_attachment = env_int("ATTACHMENT_MAX_BYTES", 10 << 20)
+
+    session_host = env("SESSION_HOST")
+    ttl = env_int("SESSION_TTL_HOURS", 72) * 3600
+    InboxHandler.session_ttl = SessionHandler.session_ttl = ttl
+    # Sessions on means the reply token alone no longer opens the public door,
+    # unless ACCEPT_REPLY_TOKEN says so (while the phone moves over).
+    InboxHandler.accept_reply_token = env("ACCEPT_REPLY_TOKEN", "0" if session_host else "1") == "1"
+    if session_host:
+        SessionHandler.token = token.encode()
+        SessionHandler.limit = RateLimiter(env_int("SESSION_RATE_PER_MIN", 10), 60)
+        SessionHandler.nonces = session.Nonces()
+        InboxHandler.newest = SessionHandler.newest = session.Newest(f"{data_dir}/session-newest.json")
+        sessions = serve_sessions(session_host, env_int("SESSION_PORT", 18443),
+                                  env("SESSION_CERT", "/session/cert.pem"), env("SESSION_KEY", "/session/key.pem"))
+        threading.Thread(target=sessions.serve_forever, daemon=True).start()
+        log.info("sessions of %dh on https://%s:%d; reply token %s on the public door", ttl // 3600,
+                 session_host, sessions.server_address[1],
+                 "still accepted" if InboxHandler.accept_reply_token else "not accepted")
 
     serve(InboxHandler, env("HOST", "0.0.0.0"), env_int("PORT", 8081)).serve_forever()
 

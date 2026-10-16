@@ -1,7 +1,8 @@
 """The relay: tailnet-only, published with Tailscale Serve, never Funnel.
 
 The agent sends it messages for the phone (POST /notify) and collects replies
-from it (GET /replies, POST /replies/ack). Every route but /healthz accepts
+from it (GET /replies, POST /replies/ack), and the voice notes and photos they
+carry (GET /attachments/<id>). Every route but /healthz accepts
 only the tailnet devices listed in ALLOWED_PEERS.
 
 A message is signed and kept in the outbox, where the Relay Inbox tool fetches
@@ -24,8 +25,8 @@ import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from .common import (REPLY_COLUMNS, HttpError, Handler, RateLimiter, env, env_int,
-                     log, parse_ips, reply_from_row, serve, setup_logging)
+from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
+                     env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
 
 MAX_HEADLINE = 120
 MAX_DETAIL = 1000
@@ -171,45 +172,70 @@ class Outbox:
 
 
 class Cursor:
-    """How far through the inbox the agent has acknowledged. Lives in the
-    relay's own data dir: the inbox database is mounted read-only here."""
+    """How far through the inbox each agent has acknowledged, by tailnet IP. Every
+    agent sees every reply and acknowledges only for itself, so one that is
+    rarely running never holds back another. Lives in the relay's own data dir:
+    the inbox database is mounted read-only here.
+
+    The file is `{"seq": n, "agents": {"<ip>": n}}`. `seq` is the one position
+    shared before agents had their own; an agent that hasn't acknowledged
+    anything yet starts there, so the switch re-delivers nothing.
+    """
 
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
 
-    def get(self):
+    def _load(self):
         try:
             with open(self.path) as f:
-                return int(json.load(f)["seq"])
-        except (FileNotFoundError, ValueError, KeyError):
-            return 0
+                data = json.load(f)
+            return int(data.get("seq", 0)), {k: int(v) for k, v in data.get("agents", {}).items()}
+        except (FileNotFoundError, ValueError, KeyError, AttributeError):
+            return 0, {}
 
-    def advance(self, seq):
+    def get(self, agent):
+        shared, agents = self._load()
+        return agents.get(agent, shared)
+
+    def advance(self, agent, seq):
         with self.lock:
-            seq = max(seq, self.get())
+            shared, agents = self._load()
+            agents[agent] = max(seq, agents.get(agent, shared))
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"seq": seq}, f)
+                json.dump({"seq": shared, "agents": agents}, f)
             os.replace(tmp, self.path)
-            return seq
+            return agents[agent]
 
 
-def read_replies(db_path, after, limit):
+def read_inbox(db_path, sql, args):
+    """Rows from the inbox's database, which this side mounts read-only."""
     if not os.path.exists(db_path):
         return []
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         db.execute("PRAGMA busy_timeout=5000")
-        rows = db.execute(f"SELECT {REPLY_COLUMNS} FROM replies WHERE seq > ? ORDER BY seq LIMIT ?",
-                          (after, limit)).fetchall()
+        return db.execute(sql, args).fetchall()
     except sqlite3.OperationalError as e:
-        if "no such table" in str(e):
+        # An older inbox, from before the table or column asked for.
+        if "no such table" in str(e) or "no such column" in str(e):
             return []
         raise
     finally:
         db.close()
-    return [reply_from_row(r) for r in rows]
+
+
+def read_replies(db_path, after, limit):
+    rows = read_inbox(db_path, f"SELECT {REPLY_COLUMNS} FROM replies WHERE seq > ? ORDER BY seq LIMIT ?",
+                      (after, limit))
+    replies = [reply_from_row(r) for r in rows]
+    ids = attachment_ids(replies)
+    # A separate read: an inbox from before transcripts has no such table, and that
+    # mustn't hide the replies.
+    transcripts = read_inbox(db_path, "SELECT attachment_id, text, error FROM transcripts WHERE attachment_id IN"
+                             f" ({','.join('?' * len(ids))})", ids) if ids else []
+    return with_transcripts(replies, {r[0]: (r[1], r[2]) for r in transcripts})
 
 
 class RelayHandler(Handler):
@@ -220,6 +246,7 @@ class RelayHandler(Handler):
     notify_limit = None
     outbox = None
     inbox_db = None
+    attachments_dir = None
     cursor = None
 
     def route(self, method):
@@ -235,9 +262,11 @@ class RelayHandler(Handler):
         if method == "POST" and url.path == "/notify":
             return self.notify()
         if method == "GET" and url.path == "/replies":
-            return self.replies(parse_qs(url.query))
+            return self.replies(str(ip), parse_qs(url.query))
         if method == "POST" and url.path == "/replies/ack":
-            return self.ack()
+            return self.ack(str(ip))
+        if method == "GET" and url.path.startswith("/attachments/"):
+            return self.attachment(url.path[len("/attachments/"):])
         raise HttpError(404, "not found")
 
     def notify(self):
@@ -280,21 +309,34 @@ class RelayHandler(Handler):
             return False
         return True
 
-    def replies(self, query):
+    def replies(self, agent, query):
         try:
             limit = min(max(int(query.get("limit", ["50"])[0]), 1), 200)
-            after = int(query["after"][0]) if "after" in query else self.cursor.get()
+            after = int(query["after"][0]) if "after" in query else self.cursor.get(agent)
         except ValueError:
             raise HttpError(400, "after and limit must be integers")
         rows = read_replies(self.inbox_db, after, limit)
-        self.send_json(200, {"replies": rows, "cursor": self.cursor.get()})
+        self.send_json(200, {"replies": rows, "cursor": self.cursor.get(agent)})
 
-    def ack(self):
+    def attachment(self, attachment_id):
+        if not ATTACHMENT_ID_RE.match(attachment_id):
+            raise HttpError(400, "attachment id must be a_ and 16 hex digits")
+        rows = read_inbox(self.inbox_db, "SELECT type, bytes FROM attachments WHERE id = ?", (attachment_id,))
+        if not rows:
+            raise HttpError(404, "no such attachment; it may have expired")
+        content_type, length = rows[0]
+        try:
+            self.send_file(os.path.join(self.attachments_dir, attachment_id), content_type, length)
+        except FileNotFoundError:
+            # Pruned between the lookup and the open.
+            raise HttpError(404, "no such attachment; it may have expired")
+
+    def ack(self, agent):
         data = self.read_json()
         up_to = data.get("upTo")
         if not isinstance(up_to, int) or isinstance(up_to, bool) or up_to < 0:
             raise HttpError(400, "upTo must be a non-negative integer (a reply's seq)")
-        self.send_json(200, {"cursor": self.cursor.advance(up_to)})
+        self.send_json(200, {"cursor": self.cursor.advance(agent, up_to)})
 
 
 def main():
@@ -312,6 +354,8 @@ def main():
     if RelayHandler.push_key and (n := RelayHandler.outbox.resign(RelayHandler.push_key)):
         log.info("re-signed %d kept message(s) under the current PUSH_KEY", n)
     RelayHandler.inbox_db = env("INBOX_DB", "/inbox/inbox.db")
+    RelayHandler.attachments_dir = env(
+        "ATTACHMENTS_DIR", os.path.join(os.path.dirname(RelayHandler.inbox_db), "attachments"))
     RelayHandler.cursor = Cursor(f"{data_dir}/cursor.json")
     RelayHandler.trusted_proxies = parse_ips(env("TRUSTED_PROXIES", "127.0.0.1,::1"))
     RelayHandler.client_ip_header = env("CLIENT_IP_HEADER", "X-Forwarded-For")

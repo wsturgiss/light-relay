@@ -4,3 +4,4 @@ __pycache__/
 *.db-journal
 .env
 data/
+webhook.env

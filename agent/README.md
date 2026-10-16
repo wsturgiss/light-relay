@@ -29,6 +29,7 @@ reachable. Every message interrupts them.
 | Continue one | `relayctl.py notify "<headline>" "<detail>" --thread <message id>` |
 | Unhandled replies | `relayctl.py replies` |
 | Mark replies handled | `relayctl.py ack <seq>` (everything up to and including `seq`) |
+| Save a voice note or photo | `relayctl.py attachment <id> [-o <path>]` |
 
 `notify` prints `{"id": "m_…", "at": "…", "thread": "m_…", "pushed": true|false}`. Keep the `id`.
 
@@ -42,6 +43,9 @@ conversation is one row in the inbox and one screen when the user opens it.
 - **The user can start a conversation too.** It arrives in `replies` with no
   `messageId`, a `thread` (`t_…`) and a `title` (their first line). Answer with
   `--thread <that thread>`, and keep using it for the rest of the conversation.
+- **Check `to` on a conversation the user started.** It names the agent they picked
+  (the relay's `AGENTS`). Take only the ones addressed to you. With no `to` (an older
+  phone, or `AGENTS` unset), agree with the other agents who takes them.
 - **New subject? Leave `--thread` off.**
 - Don't open a new conversation for a follow-up. It shows up on the phone as an
   unrelated message.
@@ -61,10 +65,29 @@ conversation is one row in the inbox and one screen when the user opens it.
 - No `messageId` but a `thread`: the user started a conversation (see
   **Conversations**), or added to it before you answered. Once you've answered, their
   replies carry your message's id as `messageId`, like any other reply.
-- A reply has a tapped `choice` or typed `text`, sometimes both.
+- A reply has a tapped `choice`, typed `text` or `attachments`, sometimes several.
+
+## Voice notes and photos
+
+A reply's `attachments` lists what the user recorded or photographed:
+`[{"id": "a_…", "type": "audio/ogg", "bytes": 48213}]`. A voice note can be the whole
+reply, with no `text`.
+
+- `relayctl.py attachment <id>` saves it here as `<id>.ogg`, `.jpg` and so on, and prints
+  `{"path", "type", "bytes"}`.
+- **Voice notes:** treat the transcript as the reply's text. The relay usually has one,
+  as `"transcript"` on the attachment, a few seconds after the note arrives. If it's
+  missing, check again shortly, or transcribe the note yourself. If neither works, tell
+  the user you got a voice note you couldn't listen to; don't guess.
+- **Photos:** look at it. Answer about what's in it, in the same thread.
+- Fetch them when the reply arrives. They're kept 30 days, then `attachment` fails with
+  a `404`.
 - **Act first, then `ack`.** Anything not acknowledged comes back next time, so a crash
   between the two can't lose a reply. Don't `ack` past a reply you haven't handled, and
   don't use `replies --ack`, which acknowledges everything it prints.
+- **Other agents may use the same relay.** You see replies to their messages too. Skip
+  any whose `messageId` or `thread` isn't one you sent, and `ack` past them freely: your
+  acknowledgements move only your own position, never theirs.
 - A reply can arrive minutes or hours later. Check on a schedule.
 
 ## Things not to do

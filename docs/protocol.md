@@ -69,6 +69,22 @@ own position, and reads change nothing on the server.
 
 Messages and replies are kept for 90 days, up to 5000 rows each.
 
+### `GET /agents`
+
+`{"agents": ["Huginn", "Claude"]}`: the inbox's `AGENTS` setting, the default first. The
+tool offers these under **To** when you start a conversation; with fewer than two it
+doesn't ask. Empty when `AGENTS` isn't set.
+
+### `GET /transcripts`
+
+Voice notes' text, when the inbox transcribes them (`TRANSCRIBE_API_KEY`). Same paging:
+`{"transcripts": [{"seq": 1, "id": "a_…", "text": "…"}]}`, where `id` is the voice note's
+attachment. A note the service couldn't do has `"text": ""` and an `"error"` for the phone
+to show, such as `"No transcription credit left"`; when the inbox restarts it tries those
+again, and a transcript that follows comes with a new `seq`. A transcript usually lands a few seconds after the reply, so the tool follows this
+feed rather than waiting for it on the reply. `GET /replies` also carries it, as `transcript`
+on the attachment, once there is one. Kept 90 days, past the audio's 30.
+
 ### `POST /replies`
 
 Body ≤ 4 KB. Two forms:
@@ -84,20 +100,88 @@ Body ≤ 4 KB. Two forms:
 - The second form starts a conversation from the phone. It has no `messageId`; `thread`
   (`t_` and 16 hex digits) is the new conversation's id, and `title` (≤ 120 characters)
   is its first line. The agent answers with `notify` and that `thread`.
+- The second form can carry `"to": "Huginn"`: which agent the conversation is for, picked
+  on the phone from `GET /agents`. It's on every reply in the conversation until an agent
+  answers; after that, `messageId` says whose it is. A name in `AGENTS` comes back spelled
+  as configured. Without `to`, the conversation is unaddressed.
+- Either form can carry `"attachments": ["a_…"]`: up to 4 voice notes or photos,
+  uploaded first. A reply with attachments needs no `choice` or `text`. Naming one that
+  hasn't been uploaded is a `400`, so upload it and send the reply again.
+
+### `PUT /attachments/<id>`
+
+A voice note or a photo, as the raw body. The phone generates `id` (`a_` and 16 hex
+digits); a resend of the same bytes is stored once, and the same `id` with different
+bytes is a `409`.
+
+| `Content-Type` | Must start with |
+|---|---|
+| `audio/ogg` (Opus) | `OggS` |
+| `audio/webm` | the EBML header |
+| `audio/mp4` (AAC) | `ftyp` at byte 4 |
+| `image/jpeg`, `image/png`, `image/webp` | their usual signatures |
+
+| Status | Meaning |
+|---|---|
+| `201` | Stored |
+| `200` | Already stored (a retry) |
+| `400` | The bytes aren't the declared type, or the id is malformed |
+| `409` | The id already holds a different file |
+| `413` | Over `ATTACHMENT_MAX_BYTES` (10 MB). Scale photos down on the phone. |
+| `415` | Not one of the types above |
+
+Attachments are kept for 30 days, and the oldest go first past 500 MB in all. The reply
+outlives them: once one has gone, its entry stays in the reply and a download is a `404`.
+There's no route to read an attachment back through the inbox.
+
+### Sessions: `POST /session`, on the LAN
+
+With `SESSION_HOST` set, the inbox routes above take a **session token** as the bearer,
+and the reply token itself is refused (unless `ACCEPT_REPLY_TOKEN=1`). The phone gets a
+session from a second, LAN-only door: `https://<SESSION_HOST>:18443/session`, with a
+self-signed certificate the tool pins.
+
+```json
+{ "at": 1791900000, "nonce": "<32-64 hex digits>", "proof": "<hex HMAC-SHA256(REPLY_TOKEN, \"renew:<at>:<nonce>\")>" }
+```
+
+→ `200 {"session": "s1.<expiry>.<mac>", "expiresAt": "…"}`. A session token is
+`s1.<expiry in unix seconds>.<hex HMAC-SHA256(REPLY_TOKEN, "session:<expiry>")>`. New keys
+end every session. Each renewal retires every session issued more than 10 minutes before
+it: the inbox keeps only the newest session's expiry (`session-newest.json`), so a pairing
+is for one phone.
+
+| Status | Meaning |
+|---|---|
+| `400` | `at` is more than 5 minutes from the inbox's clock, or the body is malformed |
+| `401` | The proof doesn't verify, or the nonce was already used |
+| `429` | Over `SESSION_RATE_PER_MIN` (10) |
 
 ## Agent ← relay: `GET /replies`, `POST /replies/ack`
 
-`GET /replies[?limit=<n ≤ 200>][&after=<seq>]` returns replies after the acknowledged
-cursor, oldest first:
+`GET /replies[?limit=<n ≤ 200>][&after=<seq>]` returns replies after the caller's
+acknowledged cursor, oldest first:
 
 ```json
 { "replies": [{ "seq": 3, "id": "r_…", "messageId": "m_…", "thread": null, "title": null,
                 "choice": "Yes", "text": null, "sentAt": "…", "receivedAt": "…" }], "cursor": 2 }
 ```
 
+Each reply also carries `"attachments": [{"id": "a_…", "type": "audio/ogg", "bytes": 5004}]`,
+empty when there are none. A voice note the inbox has transcribed also has `"transcript"`, or `"transcriptError"` when it couldn't.
+
+`GET /attachments/<id>` returns the file, with its type as `Content-Type`, or `404` once
+it has expired. With `TRANSCRIBE_API_KEY` set on the inbox, a voice note's `transcript` is on
+its attachment; without one, transcribing it is the agent's job.
+
 `POST /replies/ack {"upTo": 3}` moves the cursor and returns `{"cursor": 3}`. Acknowledge
 only after the agent has acted on a reply, so a crash in between re-delivers it instead of
 losing it.
+
+**Each agent has its own cursor**, by tailnet IP. Every agent sees every reply, including
+replies to other agents' messages, and acknowledging moves only the caller's cursor. So an
+agent acknowledges up to whatever it has handled or ignored, and can never clear a reply for
+another agent. (Before this, one cursor was shared; each agent starts from where it was.)
 
 `GET /healthz` → `{"ok": true, "paired": <PUSH_KEY set>, "push": <PUSH_ENDPOINT set>}`. It
 is the only relay route open to every tailnet device.

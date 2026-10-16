@@ -66,10 +66,18 @@ if [ -n "$SESSION_HOST" ]; then
   SESSION_MOUNT=(-v "$STATE/session:/session:ro")
 fi
 
+# Optional: WEBHOOK_URL, WEBHOOK_KEY (and WEBHOOK_AGENT, an agent's tailnet IP
+# whose ack decides re-sends) in <state dir>/webhook.env wake an agent on each reply.
+WEBHOOK_ENV=()
+if [ -f "$STATE/webhook.env" ]; then
+  chmod 600 "$STATE/webhook.env"
+  WEBHOOK_ENV=(--env-file "$STATE/webhook.env")
+fi
+
 echo "==> starting containers"
 docker rm -f light-relay light-relay-inbox >/dev/null 2>&1 || true
 docker run -d --name light-relay-inbox --restart unless-stopped --network host "${RUN_AS[@]}" \
-  --env-file "$STATE/inbox.env" -e ROLE=inbox -e HOST=127.0.0.1 -e PORT=18081 \
+  --env-file "$STATE/inbox.env" "${WEBHOOK_ENV[@]}" -e ROLE=inbox -e HOST=127.0.0.1 -e PORT=18081 \
   -v "$STATE/inbox:/data" -v "$STATE/relay:/outbox:ro" "${SESSION_MOUNT[@]}" light-relay:local >/dev/null
 docker run -d --name light-relay --restart unless-stopped --network host "${RUN_AS[@]}" \
   --env-file "$STATE/relay.env" -e ROLE=relay -e HOST=127.0.0.1 -e PORT=18080 \

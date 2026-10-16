@@ -25,7 +25,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from . import session, transcribe
+from . import session, transcribe, webhook
 from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
                      env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
 
@@ -221,6 +221,10 @@ class ReplyStore:
             self._prune()
             return cur.rowcount == 1
 
+    def newest_seq(self):
+        with self.lock:
+            return self.db.execute("SELECT MAX(seq) FROM replies").fetchone()[0] or 0
+
     def since(self, after, limit):
         with self.lock:
             rows = self.db.execute(
@@ -342,6 +346,7 @@ class InboxHandler(Handler):
     per_ip = None
     overall = None
     transcriber = None
+    notifier = None
     agents = ()
 
     def authorized(self):
@@ -398,6 +403,8 @@ class InboxHandler(Handler):
         reply = validate(self.read_json(), self.store, self.agents)
         stored = self.store.add(reply)
         log.info("reply %s from %s (%s)", reply["id"], ip, "stored" if stored else "duplicate")
+        if stored and self.notifier:
+            self.notifier.poke()
         self.send_json(202, {"ok": True})
 
     def get_messages(self, ip, query):
@@ -499,6 +506,15 @@ def main():
         log.info("transcribing voice notes with %s at %s", InboxHandler.transcriber.model, InboxHandler.transcriber.url)
     else:
         log.info("no TRANSCRIBE_API_KEY: voice notes go through without transcripts")
+
+    webhook_url = env("WEBHOOK_URL")
+    if webhook_url:
+        InboxHandler.notifier = webhook.Notifier(
+            webhook_url, env("WEBHOOK_KEY", required=True), InboxHandler.store.newest_seq,
+            env("WEBHOOK_CURSOR", "/outbox/cursor.json"), env("WEBHOOK_AGENT"),
+            env_int("WEBHOOK_REPING_SECONDS", 900)).start()
+        log.info("new replies wake a webhook%s", f" (re-sent while {env('WEBHOOK_AGENT')} is behind)"
+                 if env("WEBHOOK_AGENT") else "")
 
     session_host = env("SESSION_HOST")
     ttl = env_int("SESSION_TTL_HOURS", 72) * 3600

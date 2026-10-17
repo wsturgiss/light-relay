@@ -39,7 +39,7 @@ class Webhook(unittest.TestCase):
         self.server.shutdown()
 
     def notifier(self, **kw):
-        return webhook.Notifier(self.url, "k3y", lambda: self.seq, backoff=(0.05, 0.1), check_every=0.05, **kw)
+        return webhook.Notifier(self.url, "k3y", backoff=(0.05, 0.1), check_every=0.05, **kw)
 
     def wait_for(self, n):
         deadline = time.time() + 5
@@ -47,14 +47,19 @@ class Webhook(unittest.TestCase):
             time.sleep(0.02)
 
     def test_a_new_reply_posts_newest_seq_once(self):
-        self.notifier().start().poke()
+        self.notifier().start().poke(7)
         self.wait_for(1)
         time.sleep(0.3)
         self.assertEqual(Hook.received, [("Bearer k3y", {"newest_seq": 7})])
 
+    def test_a_named_agents_webhook_says_who_it_is_for(self):
+        self.notifier(name="Othala").start().poke(9)
+        self.wait_for(1)
+        self.assertEqual(Hook.received, [("Bearer k3y", {"newest_seq": 9, "to": "Othala"})])
+
     def test_failures_are_retried(self):
         Hook.statuses = [500, 503]
-        self.notifier().start().poke()
+        self.notifier().start().poke(7)
         self.wait_for(3)
         self.assertEqual(len(Hook.received), 3)
 
@@ -64,7 +69,7 @@ class Webhook(unittest.TestCase):
             with open(path, "w") as f:
                 json.dump({"seq": 0, "agents": {"100.1.1.1": 5}}, f)
             n = self.notifier(cursor_path=path, agent="100.1.1.1", reping=0.2).start()
-            n.poke()
+            n.poke(7)
             self.wait_for(2)
             self.assertGreaterEqual(len(Hook.received), 2)
             with open(path, "w") as f:

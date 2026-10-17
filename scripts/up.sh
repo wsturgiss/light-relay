@@ -73,14 +73,22 @@ if [ -f "$STATE/webhook.env" ]; then
   chmod 600 "$STATE/webhook.env"
   WEBHOOK_ENV=(--env-file "$STATE/webhook.env")
 fi
+# Optional: named agents (see docs/agents.md). <state dir>/agents.env holds AGENTS
+# and each agent's AGENT_<NAME>_TOKEN / AGENT_<NAME>_IP, for both containers;
+# AGENT_<NAME>_WEBHOOK_URL / _KEY go in webhook.env, which only the inbox reads.
+AGENTS_ENV=()
+if [ -f "$STATE/agents.env" ]; then
+  chmod 600 "$STATE/agents.env"
+  AGENTS_ENV=(--env-file "$STATE/agents.env")
+fi
 
 echo "==> starting containers"
 docker rm -f light-relay light-relay-inbox >/dev/null 2>&1 || true
 docker run -d --name light-relay-inbox --restart unless-stopped --network host "${RUN_AS[@]}" \
-  --env-file "$STATE/inbox.env" "${WEBHOOK_ENV[@]}" -e ROLE=inbox -e HOST=127.0.0.1 -e PORT=18081 \
+  --env-file "$STATE/inbox.env" "${AGENTS_ENV[@]}" "${WEBHOOK_ENV[@]}" -e ROLE=inbox -e HOST=127.0.0.1 -e PORT=18081 \
   -v "$STATE/inbox:/data" -v "$STATE/relay:/outbox:ro" "${SESSION_MOUNT[@]}" light-relay:local >/dev/null
 docker run -d --name light-relay --restart unless-stopped --network host "${RUN_AS[@]}" \
-  --env-file "$STATE/relay.env" -e ROLE=relay -e HOST=127.0.0.1 -e PORT=18080 \
+  --env-file "$STATE/relay.env" "${AGENTS_ENV[@]}" -e ROLE=relay -e HOST=127.0.0.1 -e PORT=18080 \
   -v "$STATE/relay:/data" -v "$STATE/inbox:/inbox:ro" light-relay:local >/dev/null
 
 sleep 2

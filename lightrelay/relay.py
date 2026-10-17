@@ -25,6 +25,8 @@ import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
+from . import agents
+from .agents import parse_agents
 from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
                      env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
 
@@ -36,6 +38,8 @@ REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 # A message the relay sent (m_), or a conversation started on the phone (t_).
 THREAD_ID_RE = re.compile(r"^[mt]_[0-9a-f]{16}$")
 RETAIN_DAYS = 90
+# How many replies one /replies call looks through for a named agent's own.
+SCAN_LIMIT = 5000
 MAX_ROWS = 5000
 
 OUTBOX_SCHEMA = """
@@ -44,7 +48,8 @@ CREATE TABLE IF NOT EXISTS messages (
     id      TEXT NOT NULL UNIQUE,
     at      TEXT NOT NULL,
     payload TEXT NOT NULL,
-    body    TEXT NOT NULL
+    body    TEXT NOT NULL,
+    agent   TEXT
 );
 """
 
@@ -134,13 +139,16 @@ class Outbox:
         self.db.execute("PRAGMA journal_mode=DELETE")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(OUTBOX_SCHEMA)
+        # Which agent sent each message, so a reply to it goes back to them.
+        if "agent" not in {r[1] for r in self.db.execute("PRAGMA table_info(messages)")}:
+            self.db.execute("ALTER TABLE messages ADD COLUMN agent TEXT")
         self.lock = threading.Lock()
 
-    def add(self, message, body):
+    def add(self, message, body, agent=None):
         payload = body.decode().split(".", 2)[2]
         with self.lock:
-            self.db.execute("INSERT INTO messages (id, at, payload, body) VALUES (?, ?, ?, ?)",
-                            (message["id"], message["at"], payload, body.decode()))
+            self.db.execute("INSERT INTO messages (id, at, payload, body, agent) VALUES (?, ?, ?, ?, ?)",
+                            (message["id"], message["at"], payload, body.decode(), agent))
             self._prune()
 
     def thread_of(self, message_id):
@@ -248,6 +256,24 @@ class RelayHandler(Handler):
     inbox_db = None
     attachments_dir = None
     cursor = None
+    agent_settings = {}   # name -> settings (agents.settings)
+    owners = None         # agents.Owners
+
+    def identify(self, ip):
+        """(agent name or None, cursor key). A bearer token names the agent; else a
+        configured AGENT_<NAME>_IP; else the caller is unnamed and keyed by IP,
+        seeing every reply, as before agents had names."""
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:].strip().encode()
+            for name, config in self.agent_settings.items():
+                if config["token"] and hmac.compare_digest(token, config["token"].encode()):
+                    return name, agents.cursor_key(name, config)
+            raise HttpError(401, "unknown agent token")
+        for name, config in self.agent_settings.items():
+            if config["ip"] == str(ip):
+                return name, agents.cursor_key(name, config)
+        return None, str(ip)
 
     def route(self, method):
         url = urlsplit(self.path)
@@ -259,17 +285,18 @@ class RelayHandler(Handler):
             log.warning("refused %s %s from %s", method, url.path, ip)
             raise HttpError(403, "forbidden")
 
+        name, key = self.identify(ip)
         if method == "POST" and url.path == "/notify":
-            return self.notify()
+            return self.notify(name)
         if method == "GET" and url.path == "/replies":
-            return self.replies(str(ip), parse_qs(url.query))
+            return self.replies(key, parse_qs(url.query), name)
         if method == "POST" and url.path == "/replies/ack":
-            return self.ack(str(ip))
+            return self.ack(key)
         if method == "GET" and url.path.startswith("/attachments/"):
             return self.attachment(url.path[len("/attachments/"):])
         raise HttpError(404, "not found")
 
-    def notify(self):
+    def notify(self, agent=None):
         if not self.push_key:
             raise HttpError(503, "not paired: set PUSH_KEY")
         message = parse_message(self.headers.get("Content-Type", "text/plain"), self.read_body())
@@ -280,7 +307,7 @@ class RelayHandler(Handler):
             message["thread"] = self.outbox.thread_of(message["thread"])
 
         body = sign(message, self.push_key)
-        self.outbox.add(message, body)
+        self.outbox.add(message, body, agent)
         pushed = self.push(message, body) if self.push_endpoint else False
         log.info("stored %s (%s)", message["id"], "pushed" if pushed else "waiting to be fetched")
         self.send_json(202, {"id": message["id"], "at": message["at"],
@@ -309,14 +336,25 @@ class RelayHandler(Handler):
             return False
         return True
 
-    def replies(self, agent, query):
+    def replies(self, key, query, name=None):
         try:
             limit = min(max(int(query.get("limit", ["50"])[0]), 1), 200)
-            after = int(query["after"][0]) if "after" in query else self.cursor.get(agent)
+            after = int(query["after"][0]) if "after" in query else self.cursor.get(key)
         except ValueError:
             raise HttpError(400, "after and limit must be integers")
-        rows = read_replies(self.inbox_db, after, limit)
-        self.send_json(200, {"replies": rows, "cursor": self.cursor.get(agent)})
+        if name is None:
+            rows = read_replies(self.inbox_db, after, limit)
+            return self.send_json(200, {"replies": rows, "cursor": self.cursor.get(key)})
+        # A named agent reads only the replies that are for it.
+        rows, scanned = [], 0
+        while len(rows) < limit and scanned < SCAN_LIMIT:
+            page = read_replies(self.inbox_db, after, 200)
+            if not page:
+                break
+            scanned += len(page)
+            after = page[-1]["seq"]
+            rows += [r for r in page if self.owners.owner(r) == name]
+        self.send_json(200, {"replies": rows[:limit], "cursor": self.cursor.get(key), "agent": name})
 
     def attachment(self, attachment_id):
         if not ATTACHMENT_ID_RE.match(attachment_id):
@@ -357,6 +395,13 @@ def main():
     RelayHandler.attachments_dir = env(
         "ATTACHMENTS_DIR", os.path.join(os.path.dirname(RelayHandler.inbox_db), "attachments"))
     RelayHandler.cursor = Cursor(f"{data_dir}/cursor.json")
+    names = parse_agents(env("AGENTS"))
+    RelayHandler.agent_settings = agents.settings(names)
+    RelayHandler.owners = agents.Owners(names, env("OUTBOX_DB", f"{data_dir}/outbox.db"), RelayHandler.inbox_db)
+    if names:
+        known = [f"{n} ({'token' if c['token'] else ''}{', ' if c['token'] and c['ip'] else ''}{'IP ' + c['ip'] if c['ip'] else ''})"
+                 for n, c in RelayHandler.agent_settings.items() if c["token"] or c["ip"]]
+        log.info("agents: %s; known by token or IP: %s", ", ".join(names), ", ".join(known) or "none")
     RelayHandler.trusted_proxies = parse_ips(env("TRUSTED_PROXIES", "127.0.0.1,::1"))
     RelayHandler.client_ip_header = env("CLIENT_IP_HEADER", "X-Forwarded-For")
     RelayHandler.max_body = env_int("RELAY_MAX_BODY", 8192)

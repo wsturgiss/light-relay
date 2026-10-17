@@ -25,7 +25,8 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from . import session, transcribe, webhook
+from . import agents, session, transcribe, webhook
+from .agents import AGENT_NAME_RE, MAX_AGENTS, parse_agents  # noqa: F401 (inbox.parse_agents)
 from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
                      env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
 
@@ -39,8 +40,6 @@ MAX_TITLE = 120
 # A conversation started on the phone. The agent continues it with notify's `thread`.
 THREAD_RE = re.compile(r"^t_[0-9a-f]{16}$")
 MAX_ATTACHMENTS = 4
-MAX_AGENTS = 8
-AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,24}$")
 
 
 def _is_mp4(head):
@@ -221,9 +220,10 @@ class ReplyStore:
             self._prune()
             return cur.rowcount == 1
 
-    def newest_seq(self):
+    def seq_of(self, reply_id):
         with self.lock:
-            return self.db.execute("SELECT MAX(seq) FROM replies").fetchone()[0] or 0
+            row = self.db.execute("SELECT seq FROM replies WHERE id = ?", (reply_id,)).fetchone()
+        return row[0] if row else 0
 
     def since(self, after, limit):
         with self.lock:
@@ -245,15 +245,6 @@ def _sha256(path):
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def parse_agents(value):
-    """`AGENTS`: the names the phone offers under To, the default first."""
-    names = [n.strip() for n in (value or "").split(",") if n.strip()]
-    bad = [n for n in names if not AGENT_NAME_RE.match(n)]
-    if bad or len(names) > MAX_AGENTS or len({n.lower() for n in names}) != len(names):
-        raise SystemExit(f"AGENTS must be up to {MAX_AGENTS} distinct names of [A-Za-z0-9 ._-], at most 24 chars each")
-    return names
 
 
 def validate(data, store, agents=()):
@@ -346,7 +337,8 @@ class InboxHandler(Handler):
     per_ip = None
     overall = None
     transcriber = None
-    notifier = None
+    notifiers = {}   # agent name (None: every reply) -> webhook.Notifier
+    owners = None    # agents.Owners
     agents = ()
 
     def authorized(self):
@@ -399,12 +391,20 @@ class InboxHandler(Handler):
             self.transcriber.submit(attachment_id)
         self.send_json(201 if stored else 200, {"ok": True})
 
+    def wake(self, reply):
+        """POST to the webhook of the agent this reply is for, and only theirs."""
+        seq = self.store.seq_of(reply["id"])
+        owner = self.owners.owner(reply) if self.owners else None
+        for name in {None, owner}:
+            if name in self.notifiers:
+                self.notifiers[name].poke(seq)
+
     def post_reply(self, ip, _query):
         reply = validate(self.read_json(), self.store, self.agents)
         stored = self.store.add(reply)
         log.info("reply %s from %s (%s)", reply["id"], ip, "stored" if stored else "duplicate")
-        if stored and self.notifier:
-            self.notifier.poke()
+        if stored and self.notifiers:
+            self.wake(reply)
         self.send_json(202, {"ok": True})
 
     def get_messages(self, ip, query):
@@ -475,6 +475,30 @@ def serve_sessions(host, port, cert, key):
     return server
 
 
+def notifiers(names, settings):
+    """A webhook per agent that has one. The older single WEBHOOK_URL (with
+    WEBHOOK_AGENT, the IP whose ack it watches) is the default agent's, unless
+    that agent has its own; with no AGENTS at all, it fires for every reply."""
+    cursor = env("WEBHOOK_CURSOR", "/outbox/cursor.json")
+    reping = env_int("WEBHOOK_REPING_SECONDS", 900)
+    out = {}
+    for name, config in settings.items():
+        if config["webhook_url"]:
+            out[name] = webhook.Notifier(config["webhook_url"], config["webhook_key"], name, cursor,
+                                         agents.cursor_key(name, config), reping)
+    if env("WEBHOOK_URL"):
+        default = names[0] if names else None
+        if default not in out:
+            out[default] = webhook.Notifier(env("WEBHOOK_URL"), env("WEBHOOK_KEY", required=True), default, cursor,
+                                            env("WEBHOOK_AGENT") or (settings[default]["ip"] if default else None),
+                                            reping)
+    for name, notifier in out.items():
+        notifier.start()
+        log.info("replies %s wake a webhook%s", f"for {name}" if name else "(all)",
+                 f" (re-sent while {notifier.agent} is behind)" if notifier.agent else "")
+    return out
+
+
 def main():
     setup_logging()
     token = env("REPLY_TOKEN", required=True)
@@ -507,14 +531,8 @@ def main():
     else:
         log.info("no TRANSCRIBE_API_KEY: voice notes go through without transcripts")
 
-    webhook_url = env("WEBHOOK_URL")
-    if webhook_url:
-        InboxHandler.notifier = webhook.Notifier(
-            webhook_url, env("WEBHOOK_KEY", required=True), InboxHandler.store.newest_seq,
-            env("WEBHOOK_CURSOR", "/outbox/cursor.json"), env("WEBHOOK_AGENT"),
-            env_int("WEBHOOK_REPING_SECONDS", 900)).start()
-        log.info("new replies wake a webhook%s", f" (re-sent while {env('WEBHOOK_AGENT')} is behind)"
-                 if env("WEBHOOK_AGENT") else "")
+    InboxHandler.notifiers = notifiers(InboxHandler.agents, agents.settings(InboxHandler.agents))
+    InboxHandler.owners = agents.Owners(InboxHandler.agents, InboxHandler.outbox_db, f"{data_dir}/inbox.db")
 
     session_host = env("SESSION_HOST")
     ttl = env_int("SESSION_TTL_HOURS", 72) * 3600

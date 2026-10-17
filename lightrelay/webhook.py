@@ -1,4 +1,5 @@
-"""Wake an agent when a reply arrives: POST {"newest_seq": n} to its webhook.
+"""Wake an agent when a reply for it arrives: POST {"newest_seq": n, "to": name}
+to its webhook (without "to" for the one unnamed webhook).
 
 Runs on its own thread so storing a reply never waits on the network. A failed
 POST is retried with exponential backoff. If the agent's acknowledged position
@@ -26,9 +27,11 @@ def read_ack(path, agent):
 
 
 class Notifier:
-    def __init__(self, url, key, newest, cursor_path=None, agent=None, reping=900,
+    def __init__(self, url, key, name=None, cursor_path=None, agent=None, reping=900,
                  backoff=(5, 600), timeout=10, check_every=60, clock=time.monotonic):
-        self.url, self.key, self.newest = url, key, newest
+        """`agent` is the agent's key in the cursor file (its IP, or agent:<name>)."""
+        self.url, self.key, self.name = url, key, name
+        self.latest = 0           # newest seq of a reply for this agent
         self.cursor_path, self.agent, self.reping = cursor_path, agent, reping
         self.backoff_min, self.backoff_max = backoff
         self.timeout, self.check_every, self.clock = timeout, check_every, clock
@@ -37,14 +40,19 @@ class Notifier:
         self.sent_seq = 0         # newest seq announced successfully
         self.sent_at = None       # when (clock)
         self.lock = threading.Lock()
+        self.label = f" for {name}" if name else ""
 
     def start(self):
         threading.Thread(target=self._run, daemon=True, name="webhook").start()
         return self
 
-    def poke(self):
-        """A reply was stored. Returns at once."""
+    def newest(self):
+        return self.latest
+
+    def poke(self, seq):
+        """A reply for this agent was stored as `seq`. Returns at once."""
         with self.lock:
+            self.latest = max(self.latest, seq)
             self.pending = True
         self.wake.set()
 
@@ -64,7 +72,7 @@ class Notifier:
         return None
 
     def post(self, seq):
-        req = urllib.request.Request(self.url, data=json.dumps({"newest_seq": seq}).encode(), method="POST",
+        req = urllib.request.Request(self.url, data=json.dumps({"newest_seq": seq, **({"to": self.name} if self.name else {})}).encode(), method="POST",
                                      headers={"Authorization": f"Bearer {self.key}",
                                               "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -79,14 +87,14 @@ class Notifier:
                 self.pending = False
             try:
                 status = self.post(seq)
-                log.info("webhook: newest_seq=%d -> HTTP %d", seq, status)
+                log.info("webhook%s: newest_seq=%d -> HTTP %d", self.label, seq, status)
                 self.sent_seq, self.sent_at = seq, self.clock()
                 return status
             except urllib.error.HTTPError as e:
                 e.close()
-                log.warning("webhook: newest_seq=%d -> HTTP %d; retrying in %gs", seq, e.code, delay)
+                log.warning("webhook%s: newest_seq=%d -> HTTP %d; retrying in %gs", self.label, seq, e.code, delay)
             except Exception as e:  # network, timeout, DNS
-                log.warning("webhook: newest_seq=%d failed (%s); retrying in %gs", seq, e, delay)
+                log.warning("webhook%s: newest_seq=%d failed (%s); retrying in %gs", self.label, seq, e, delay)
             with self.lock:
                 self.pending = True
             self.wake.wait(delay)

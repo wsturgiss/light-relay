@@ -2,7 +2,8 @@
 
 The inbox hands each voice note to a `Transcriber` as it's stored. A worker
 thread sends it to an OpenAI-compatible `/audio/transcriptions` endpoint
-(OpenAI by default; Groq and others speak the same API) and keeps the text in
+(OpenAI by default; Groq speaks the same API, and xAI's /v1/stt takes the
+same upload) and keeps the text in
 the inbox database, where the phone and the agent pick it up. Without a key
 nothing is sent anywhere, and voice notes go through as before.
 """
@@ -117,7 +118,8 @@ class Transcriber:
             return
 
     def call(self, data, content_type, attachment_id):
-        body, header = multipart({"model": self.model, "response_format": "json"}, "file",
+        # Only the fields OpenAI and xAI (/v1/stt) share: both answer JSON with "text".
+        body, header = multipart({"model": self.model}, "file",
                                  f"{attachment_id}.{EXTENSIONS[content_type]}", content_type, data)
         request = urllib.request.Request(self.url, data=body, method="POST", headers={
             "Authorization": f"Bearer {self.api_key}", "Content-Type": header})

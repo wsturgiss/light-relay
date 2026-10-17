@@ -41,6 +41,9 @@ RETAIN_DAYS = 90
 # How many replies one /replies call looks through for a named agent's own.
 SCAN_LIMIT = 5000
 MAX_ROWS = 5000
+# GET /channel: entries returned by default, and at most.
+CHANNEL_LIMIT = 100
+MAX_CHANNEL_LIMIT = 1000
 
 OUTBOX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -150,6 +153,12 @@ class Outbox:
             self.db.execute("INSERT INTO messages (id, at, payload, body, agent) VALUES (?, ?, ?, ?, ?)",
                             (message["id"], message["at"], payload, body.decode(), agent))
             self._prune()
+
+    def all(self):
+        """(seq, message) for everything kept, oldest first."""
+        with self.lock:
+            rows = self.db.execute("SELECT seq, payload FROM messages ORDER BY seq").fetchall()
+        return [(seq, json.loads(payload)) for seq, payload in rows]
 
     def thread_of(self, message_id):
         """The conversation `message_id` belongs to: the id of its first message.
@@ -290,6 +299,8 @@ class RelayHandler(Handler):
             return self.notify(name)
         if method == "GET" and url.path == "/replies":
             return self.replies(key, parse_qs(url.query), name)
+        if method == "GET" and url.path == "/channel":
+            return self.channel(name, parse_qs(url.query))
         if method == "POST" and url.path == "/replies/ack":
             return self.ack(key)
         if method == "GET" and url.path.startswith("/attachments/"):
@@ -358,6 +369,45 @@ class RelayHandler(Handler):
             after = page[-1]["seq"]
             rows += [r for r in page if self.owners.owner(r) == name]
         self.send_json(200, {"replies": rows[:limit], "cursor": self.cursor.get(key), "agent": name})
+
+    def channel(self, name, query):
+        """Everything between the phone and one agent, as the phone shows it: the
+        agent's messages and the replies that are for it, oldest first. Read-only:
+        it neither acknowledges nor moves anyone's cursor."""
+        if name is None:
+            raise HttpError(403, "a channel belongs to a named agent: send your token")
+        try:
+            limit = min(max(int(query.get("limit", [str(CHANNEL_LIMIT)])[0]), 1), MAX_CHANNEL_LIMIT)
+        except ValueError:
+            raise HttpError(400, "limit must be an integer")
+        owners = self.owners.cached()
+        entries = []
+        for seq, m in self.outbox.all():
+            if owners.message_owner(m["id"]) != name:
+                continue
+            entry = {"direction": "out", "kind": "message", "seq": seq, "at": m["at"], "id": m["id"],
+                     "thread": m.get("thread", m["id"]), "headline": m.get("headline", ""),
+                     "detail": m.get("detail", ""), "choices": m.get("choices", [])}
+            if m.get("ref"):
+                entry["ref"] = m["ref"]
+            entries.append(entry)
+        for r in read_replies(self.inbox_db, 0, MAX_ROWS):
+            if owners.owner(r) != name:
+                continue
+            thread = r["thread"] or (self.outbox.thread_of(r["messageId"]) if r["messageId"] else r["id"])
+            for a in r["attachments"]:
+                a["path"] = f"/attachments/{a['id']}"
+            entries.append({"direction": "in", "kind": "reply", "seq": r["seq"], "at": r["receivedAt"],
+                            "id": r["id"], "messageId": r["messageId"], "thread": thread, "to": r["to"],
+                            "title": r["title"], "choice": r["choice"], "text": r["text"],
+                            "attachments": r["attachments"], "sentAt": r["sentAt"], "receivedAt": r["receivedAt"]})
+        # One clock for both sides: when the relay stored the message or received the reply.
+        # Times are to the second; within one, the agent's messages come first (a reply
+        # can't come before the message it answers), then each side in its own order.
+        entries.sort(key=lambda e: (e["at"], e["direction"] == "in", e["seq"]))
+        latest = entries[-1] if entries else None
+        self.send_json(200, {"agent": name, "total": len(entries), "entries": entries[-limit:],
+                             "thread": latest["thread"] if latest else None})
 
     def attachment(self, attachment_id):
         if not ATTACHMENT_ID_RE.match(attachment_id):

@@ -20,6 +20,7 @@ A reply is for:
      outbox recorded senders belong to the default agent.
 """
 
+import functools
 import json
 import os
 import re
@@ -93,6 +94,24 @@ class Owners:
         self.names = tuple(names)
         self.outbox_db = outbox_db
         self.inbox_db = inbox_db
+
+    def cached(self):
+        """A copy that remembers each lookup, for one request that asks about many
+        replies (GET /channel). Same answers; each message or thread is read once."""
+        copy = Owners(self.names, self.outbox_db, self.inbox_db)
+        copy.message_agent = functools.lru_cache(maxsize=None)(copy.message_agent)
+        copy.thread_agent = functools.lru_cache(maxsize=None)(copy.thread_agent)
+        return copy
+
+    def message_owner(self, message_id):
+        """The agent a sent message belongs to, as the phone files it: who sent it,
+        else who its conversation is for, else the default agent."""
+        try:
+            found = self.message_agent(message_id)
+        except sqlite3.Error as e:
+            log.warning("couldn't tell whose message %s is: %s", message_id, e)
+            found = None
+        return self.canonical(found) if found else self.default
 
     @property
     def default(self):

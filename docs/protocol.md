@@ -183,6 +183,33 @@ replies to other agents' messages, and acknowledging moves only the caller's cur
 agent acknowledges up to whatever it has handled or ignored, and can never clear a reply for
 another agent. (Before this, one cursor was shared; each agent starts from where it was.)
 
+## Agent ← relay: `GET /channel`
+
+`GET /channel[?limit=<n ≤ 1000, default 100>]` returns the caller's channel, as the phone
+shows it: the agent's own messages (`direction: "out"`) and the replies that are for it
+(`"in"`, the same rule as `/replies`), merged and oldest first. With a limit, it returns the
+newest n, still oldest first. It needs a named agent (a token, or an `AGENT_<NAME>_IP`).
+Otherwise it answers `403`. It is read-only: no cursor moves.
+
+```json
+{ "agent": "Jarvis", "total": 12, "thread": "t_…",
+  "entries": [
+    { "direction": "out", "kind": "message", "seq": 57, "at": "2026-10-17T03:07:23Z", "id": "m_…",
+      "thread": "m_…", "headline": "…", "detail": "…", "choices": [] },
+    { "direction": "in", "kind": "reply", "seq": 75, "at": "2026-10-17T03:08:02Z", "id": "r_…",
+      "messageId": "m_…", "thread": "m_…", "to": null, "title": null, "choice": null, "text": "…",
+      "attachments": [{ "id": "a_…", "type": "audio/mp4", "bytes": 23324, "transcript": "…",
+                        "path": "/attachments/a_…" }],
+      "sentAt": "…", "receivedAt": "…" } ] }
+```
+
+`seq` is the outbox's for `out` entries and the inbox's for `in` ones (the same `seq` as
+`/replies` and `/replies/ack`). `at` is UTC, to the second: when the relay stored the message or received
+the reply. Within one second, messages come before replies. `thread` is each entry's
+conversation (its first message, or the phone's `t_…`). The top-level `thread` is the newest
+entry's, so `POST /notify {"headline": …, "thread": <that>}` continues where the channel left
+off.
+
 `GET /healthz` → `{"ok": true, "paired": <PUSH_KEY set>, "push": <PUSH_ENDPOINT set>}`. It
 is the only relay route open to every tailnet device.
 

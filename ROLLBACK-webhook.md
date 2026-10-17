@@ -44,3 +44,14 @@ message). The image before it is tagged `light-relay:pre-sender` (named agents +
     sed -i 's/^docker build .*/: # skip build/' lr-old/scripts/up.sh && lr-old/scripts/up.sh
 
 Phones keep working either way: the app reads `from` when it's there and otherwise works out the agent itself.
+
+# Rolling back GET /channel (2026-10-17, 07:45 EDT)
+
+Deployed from branch `agent-channel`. It adds one read-only route, GET /channel, and changes nothing else. The image before it
+is tagged `light-relay:pre-channel` (the signed sender name). Settings are unchanged.
+
+    docker tag light-relay:pre-channel light-relay:local
+    cd /tmp && rm -rf lr-old && mkdir lr-old && git -C ~/Projects/light-relay archive message-sender | tar -x -C lr-old
+    sed -i 's/^docker build .*/: # skip build/' lr-old/scripts/up.sh && lr-old/scripts/up.sh
+
+Without it, `~/light-relay/channel.sh` on the box gets 404 from /channel. Everything else keeps working.

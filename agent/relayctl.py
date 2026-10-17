@@ -8,6 +8,8 @@ relay's ALLOWED_PEERS). It holds no secrets: the relay knows it by its device.
 
     relayctl.py notify "Relay test" "If you can read this, the path works."
     relayctl.py notify "Book the 9:40?" "Holds expire at noon." --choice Yes --choice No
+    relayctl.py notify "Clean up?" --choice keep=Keep --danger del="Delete all" --other   # danger asks to confirm
+    relayctl.py notify "Groceries?" --choice Milk --choice Eggs --choice Bread --many    # pick several, then Done
     relayctl.py notify "Booked." "Seat 14C." --thread m_5eea46d64d2ed130   # continue that conversation
     relayctl.py replies            # new replies, as JSON; does not mark them read
     relayctl.py replies --ack      # print them, then mark them read
@@ -48,6 +50,23 @@ def call(method, path, payload=None, save=None):
         sys.exit(f"{method} {path}: {e.reason} (is this machine on the tailnet?)")
 
 
+def choice_arg(style):
+    """--choice LABEL or --choice ID=LABEL (an id of [A-Za-z0-9_-] that comes back in choiceIds)."""
+    def parse(value):
+        cid, sep, label = value.partition("=")
+        if not sep or not cid or not all(ch.isalnum() or ch in "_-" for ch in cid):
+            cid, label = None, value
+        return {"id": cid, "label": label, "style": style}
+    return parse
+
+
+def choices_payload(choices):
+    """Plain labels when that says it all, so old relays still take it; objects otherwise."""
+    if all(c["style"] == "default" and not c["id"] for c in choices):
+        return [c["label"] for c in choices]
+    return [{k: v for k, v in c.items() if v and not (k == "style" and v == "default")} for c in choices]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -55,7 +74,12 @@ def main():
     n = sub.add_parser("notify", help="put a message on the phone")
     n.add_argument("headline")
     n.add_argument("detail", nargs="?", default="")
-    n.add_argument("--choice", action="append", default=[], help="a tappable answer; repeat, up to 4")
+    n.add_argument("--choice", dest="choices", action="append", default=[], type=choice_arg("default"), metavar="LABEL",
+                   help="a tappable answer, LABEL or ID=LABEL; repeat, up to 4 in all (with --danger)")
+    n.add_argument("--danger", dest="choices", action="append", type=choice_arg("danger"), metavar="LABEL",
+                   help="a tappable answer shown as dangerous; the phone asks to confirm it")
+    n.add_argument("--many", action="store_true", help="the user can pick several choices, then Done")
+    n.add_argument("--other", action="store_true", help="also offer Other: a typed answer")
     n.add_argument("--ref", help="your own id for this message, echoed back in the push")
     n.add_argument("--thread", help="continue the conversation this message id is part of "
                                     "(e.g. the messageId of the reply you're answering)")
@@ -75,7 +99,11 @@ def main():
 
     args = parser.parse_args()
     if args.cmd == "notify":
-        payload = {"headline": args.headline, "detail": args.detail, "choices": args.choice}
+        payload = {"headline": args.headline, "detail": args.detail, "choices": choices_payload(args.choices)}
+        if args.many:
+            payload["select"] = "many"
+        if args.other:
+            payload["other"] = True
         if args.ref:
             payload["ref"] = args.ref
         if args.thread:

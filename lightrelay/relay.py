@@ -30,13 +30,15 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import agents, images
 from .agents import parse_agents
-from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
+from .common import (message_options, ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
                      env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
 
 MAX_HEADLINE = 120
 MAX_DETAIL = 1000
 MAX_CHOICES = 4
 MAX_CHOICE = 24
+CHOICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+CHOICE_STYLES = ("default", "danger")
 REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 # A message the relay sent (m_), or a conversation started on the phone (t_).
 THREAD_ID_RE = re.compile(r"^[mt]_[0-9a-f]{16}$")
@@ -95,7 +97,7 @@ def parse_multipart(content_type, body):
                 choices.extend(json.loads(value))
             except (ValueError, TypeError):
                 raise HttpError(400, "choices must be a JSON list")
-        elif name in ("headline", "detail", "ref", "thread"):
+        elif name in ("headline", "detail", "ref", "thread", "select", "other"):
             fields[name] = value
     fields["choices"] = choices
     if image is not None and not image:
@@ -113,7 +115,10 @@ def parse_message(content_type, body):
         data, image = parse_multipart(content_type, body)
         headline, detail, choices = data.get("headline"), data.get("detail", ""), data["choices"]
         ref, thread = data.get("ref") or None, data.get("thread") or None
-        return _message(headline, detail, choices, ref, thread), image
+        other = data.get("other")
+        if other is not None:
+            other = other.strip().lower() in ("1", "true", "yes", "on")
+        return _message(headline, detail, choices, ref, thread, data.get("select") or None, other), image
     try:
         raw = body.decode("utf-8")
     except UnicodeDecodeError:
@@ -131,15 +136,44 @@ def parse_message(content_type, body):
         choices = data.get("choices", [])
         ref = data.get("ref")
         thread = data.get("thread")
+        select, other = data.get("select"), data.get("other")
         if data.get("image") is not None:
             image = images.decode_base64(data["image"])
     else:
         headline, _, detail = raw.strip().partition("\n")
-        choices, ref, thread = [], None, None
-    return _message(headline, detail, choices, ref, thread), image
+        choices, ref, thread, select, other = [], None, None, None, None
+    return _message(headline, detail, choices, ref, thread, select, other), image
 
 
-def _message(headline, detail, choices, ref, thread):
+def _options(choices):
+    """Choices are labels, or objects {id, label, style}. Returns [{id, label, style}];
+    ids default to c1, c2, ... and style to "default"."""
+    error = (f"choices must be up to {MAX_CHOICES} labels of at most {MAX_CHOICE} chars,"
+             ' or {"id", "label", "style": "default"|"danger"} objects')
+    if not isinstance(choices, list) or len(choices) > MAX_CHOICES:
+        raise HttpError(400, error)
+    options = []
+    for n, c in enumerate(choices, 1):
+        if isinstance(c, str):
+            c = {"label": c}
+        if not isinstance(c, dict) or set(c) - {"id", "label", "style"}:
+            raise HttpError(400, error)
+        label, cid, style = c.get("label"), c.get("id", f"c{n}"), c.get("style") or "default"
+        if not isinstance(label, str) or not label.strip() or len(label.strip()) > MAX_CHOICE:
+            raise HttpError(400, error)
+        if not isinstance(cid, str) or not CHOICE_ID_RE.match(cid):
+            raise HttpError(400, "a choice id must be 1-24 of [A-Za-z0-9_-]")
+        if style not in CHOICE_STYLES:
+            raise HttpError(400, 'a choice style must be "default" or "danger"')
+        options.append({"id": cid, "label": label.strip(), "style": style})
+    if len({o["id"] for o in options}) != len(options):
+        raise HttpError(400, "choice ids must be distinct")
+    if len({o["label"].lower() for o in options}) != len(options):
+        raise HttpError(400, "choice labels must be distinct")
+    return options
+
+
+def _message(headline, detail, choices, ref, thread, select=None, other=None):
     if not isinstance(headline, str) or not headline.strip():
         raise HttpError(400, "headline is required")
     headline = headline.strip()
@@ -150,9 +184,15 @@ def _message(headline, detail, choices, ref, thread):
     detail = detail.strip()
     if len(detail) > MAX_DETAIL:
         raise HttpError(400, f"detail is over {MAX_DETAIL} chars")
-    if (not isinstance(choices, list) or len(choices) > MAX_CHOICES
-            or not all(isinstance(c, str) and c.strip() and len(c.strip()) <= MAX_CHOICE for c in choices)):
-        raise HttpError(400, f"choices must be up to {MAX_CHOICES} strings of at most {MAX_CHOICE} chars")
+    options = _options(choices)
+    if select not in (None, "one", "many"):
+        raise HttpError(400, 'select must be "one" or "many"')
+    if other is not None and not isinstance(other, bool):
+        raise HttpError(400, "other must be true or false")
+    if (select == "many" or other) and not options:
+        raise HttpError(400, "select and other need choices")
+    if select == "many" and len(options) < 2:
+        raise HttpError(400, 'select "many" needs at least 2 choices')
     if ref is not None and (not isinstance(ref, str) or not REF_RE.match(ref)):
         raise HttpError(400, "ref must be 1-64 of [A-Za-z0-9_.:-]")
     if thread is not None and (not isinstance(thread, str) or not THREAD_ID_RE.match(thread)):
@@ -164,8 +204,16 @@ def _message(headline, detail, choices, ref, thread):
         "at": now_iso(),
         "headline": headline,
         "detail": detail,
-        "choices": [c.strip() for c in choices],
+        # Labels only, so a tool from before choice objects still shows them.
+        "choices": [o["label"] for o in options],
     }
+    # The richer form, only when it says more than the labels do.
+    if any(o["style"] != "default" or o["id"] != f"c{n}" for n, o in enumerate(options, 1)):
+        message["options"] = options
+    if select == "many":
+        message["select"] = "many"
+    if other:
+        message["other"] = True
     if ref:
         message["ref"] = ref
     if thread:
@@ -486,6 +534,10 @@ class RelayHandler(Handler):
             entry = {"direction": "out", "kind": "message", "seq": seq, "at": m["at"], "id": m["id"],
                      "thread": m.get("thread", m["id"]), "headline": m.get("headline", ""),
                      "detail": m.get("detail", ""), "choices": m.get("choices", [])}
+            if m.get("choices"):
+                entry["options"] = message_options(m)
+                entry["select"] = m.get("select", "one")
+                entry["other"] = bool(m.get("other"))
             if m.get("ref"):
                 entry["ref"] = m["ref"]
             if m.get("image"):
@@ -500,6 +552,8 @@ class RelayHandler(Handler):
             entries.append({"direction": "in", "kind": "reply", "seq": r["seq"], "at": r["receivedAt"],
                             "id": r["id"], "messageId": r["messageId"], "thread": thread, "to": r["to"],
                             "title": r["title"], "choice": r["choice"], "text": r["text"],
+                            "choiceIds": r["choiceIds"], "other": r["other"], "answeredAt": r["answeredAt"],
+                            "secondAnswer": r["secondAnswer"],
                             "attachments": r["attachments"], "sentAt": r["sentAt"], "receivedAt": r["receivedAt"]})
         # One clock for both sides: when the relay stored the message or received the reply.
         # Times are to the second; within one, the agent's messages come first (a reply

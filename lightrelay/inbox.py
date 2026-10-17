@@ -32,7 +32,9 @@ from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLi
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_TEXT = 1000
-MAX_CHOICE = 64
+# A choice, or the labels of several picked together (select "many"), joined with ", ".
+MAX_CHOICE = 120
+MAX_CHOICE_IDS = 4
 RETAIN_DAYS = 90
 MAX_ROWS = 5000
 MAX_FETCH = 100
@@ -107,9 +109,12 @@ class ReplyStore:
         have = {row[1] for row in self.db.execute("PRAGMA table_info(replies)")}
         # attachments: added with voice notes and photos.
         # to_agent: added with choosing who a conversation is for.
-        for column in ("thread", "title", "attachments", "to_agent"):
+        # choice_ids, other, answered_at, second_answer: added with question upgrades.
+        for column, kind in (("thread", "TEXT"), ("title", "TEXT"), ("attachments", "TEXT"), ("to_agent", "TEXT"),
+                             ("choice_ids", "TEXT"), ("other", "INTEGER"), ("answered_at", "TEXT"),
+                             ("second_answer", "INTEGER")):
             if column not in have:
-                self.db.execute(f"ALTER TABLE replies ADD COLUMN {column} TEXT")
+                self.db.execute(f"ALTER TABLE replies ADD COLUMN {column} {kind}")
         if "error" not in {row[1] for row in self.db.execute("PRAGMA table_info(transcripts)")}:
             self.db.execute("ALTER TABLE transcripts ADD COLUMN error TEXT")
         self.lock = threading.Lock()
@@ -207,18 +212,39 @@ class ReplyStore:
         return [r[0] for r in rows]
 
     def add(self, reply):
-        """Store a reply. Returns False if its id was already stored (a retry)."""
+        """Store a reply. Returns False if its id was already stored (a retry).
+
+        A reply that answers a question (a choice, or the free-text "Other") records
+        when the question was first answered. One that comes after that is kept, so
+        nothing you sent is lost, but flagged `second_answer`."""
+        now = now_iso()
+        answers = bool(reply.get("messageId") and (reply.get("choice") or reply.get("choiceIds") or reply.get("other")))
         with self.lock:
+            answered_at, second = None, False
+            if answers:
+                row = self.db.execute(
+                    "SELECT MIN(received_at) FROM replies WHERE message_id = ? AND answered_at IS NOT NULL AND id != ?",
+                    (reply["messageId"], reply["id"])).fetchone()
+                answered_at, second = (row[0], True) if row and row[0] else (now, False)
             cur = self.db.execute(
                 "INSERT OR IGNORE INTO replies"
-                " (id, message_id, thread, title, choice, text, sent_at, received_at, attachments, to_agent)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " (id, message_id, thread, title, choice, text, sent_at, received_at, attachments, to_agent,"
+                " choice_ids, other, answered_at, second_answer)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (reply["id"], reply.get("messageId"), reply.get("thread"), reply.get("title"),
-                 reply.get("choice"), reply.get("text"), reply.get("sentAt"), now_iso(),
-                 json.dumps(reply["attachments"]) if reply.get("attachments") else None, reply.get("to")),
+                 reply.get("choice"), reply.get("text"), reply.get("sentAt"), now,
+                 json.dumps(reply["attachments"]) if reply.get("attachments") else None, reply.get("to"),
+                 json.dumps(reply["choiceIds"]) if reply.get("choiceIds") else None,
+                 1 if reply.get("other") else None, answered_at, 1 if second else None),
             )
             self._prune()
             return cur.rowcount == 1
+
+    def answer_of(self, reply_id):
+        """(answeredAt, secondAnswer) as stored for a reply."""
+        with self.lock:
+            row = self.db.execute("SELECT answered_at, second_answer FROM replies WHERE id = ?", (reply_id,)).fetchone()
+        return (row[0], bool(row[1])) if row else (None, False)
 
     def seq_of(self, reply_id):
         with self.lock:
@@ -247,7 +273,55 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def validate(data, store, agents=()):
+def check_answer(data, message):
+    """choiceIds and other, checked against the question they answer when the outbox
+    still has it. Returns (choiceIds or None, other, choice label(s) or None)."""
+    from .common import message_options
+    ids, other, choice = data.get("choiceIds"), data.get("other"), data.get("choice")
+    other = False if other is None else other
+    if ids is not None and (not isinstance(ids, list) or not 1 <= len(ids) <= MAX_CHOICE_IDS
+                            or len(set(ids)) != len(ids) or not all(isinstance(i, str) and ID_RE.match(i) for i in ids)):
+        raise HttpError(400, f"choiceIds must be 1-{MAX_CHOICE_IDS} distinct choice ids")
+    if not isinstance(other, bool):
+        raise HttpError(400, "other must be true or false")
+    if (ids or other) and not data.get("messageId"):
+        raise HttpError(400, "choiceIds and other answer a message, so they need a messageId")
+    if ids and other:
+        raise HttpError(400, "an answer is choiceIds or other, not both")
+    if message is None:
+        return ids or None, other, choice
+    options = {o["id"]: o["label"] for o in message_options(message)}
+    if ids:
+        if not set(ids) <= set(options):
+            raise HttpError(400, "choiceIds must be choices the message offers")
+        if len(ids) > 1 and message.get("select") != "many":
+            raise HttpError(400, "this message takes one choice")
+        # The labels, in the message's order, are what the agent reads as `choice`.
+        choice = ", ".join(label for cid, label in options.items() if cid in ids)
+    if other and not message.get("other"):
+        raise HttpError(400, "this message doesn't offer Other")
+    return ids or None, other, choice
+
+
+def outbox_message(db_path, message_id):
+    """The message as the relay signed it, or None (not there, or no outbox)."""
+    if not db_path or not message_id or not os.path.exists(db_path):
+        return None
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA busy_timeout=5000")
+        row = db.execute("SELECT body FROM messages WHERE id = ?", (message_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        db.close()
+    try:
+        return json.loads(row[0].split(".", 2)[2]) if row else None
+    except (ValueError, IndexError):
+        return None
+
+
+def validate(data, store, agents=(), outbox_db=None):
     reply_id = data.get("id")
     if not isinstance(reply_id, str) or not ID_RE.match(reply_id):
         raise HttpError(400, "id must be 1-64 of [A-Za-z0-9_-]")
@@ -271,6 +345,12 @@ def validate(data, store, agents=()):
             # Upload first, then reply. The phone uploads again on this answer.
             raise HttpError(400, f"attachment {attachment_id} hasn't been uploaded")
         attachments.append(found)
+    choice_ids, other, choice = check_answer(data, outbox_message(outbox_db, message_id) if (
+        data.get("choiceIds") or data.get("other")) else None)
+    if other and not (text and text.strip()):
+        raise HttpError(400, "an Other answer needs text")
+    if choice is not None and len(choice) > MAX_CHOICE:
+        raise HttpError(400, f"choice must be a string of at most {MAX_CHOICE} chars")
     if not (choice or (text and text.strip()) or attachments):
         raise HttpError(400, "a reply needs a choice, text or an attachment")
     sent_at = data.get("sentAt")
@@ -294,7 +374,7 @@ def validate(data, store, agents=()):
             raise HttpError(400, "to must be an agent's name")
     return {"id": reply_id, "messageId": message_id, "thread": thread, "title": title or None,
             "choice": choice or None, "text": text or None, "sentAt": sent_at,
-            "attachments": attachments, "to": to}
+            "attachments": attachments, "to": to, "choiceIds": choice_ids, "other": other}
 
 
 def read_messages(db_path, after, limit):
@@ -420,12 +500,17 @@ class InboxHandler(Handler):
                 self.notifiers[name].poke(seq)
 
     def post_reply(self, ip, _query):
-        reply = validate(self.read_json(), self.store, self.agents)
+        reply = validate(self.read_json(), self.store, self.agents, self.outbox_db)
         stored = self.store.add(reply)
-        log.info("reply %s from %s (%s)", reply["id"], ip, "stored" if stored else "duplicate")
+        answered_at, second = self.store.answer_of(reply["id"])
+        log.info("reply %s from %s (%s%s)", reply["id"], ip, "stored" if stored else "duplicate",
+                 ", a second answer" if second else "")
         if stored and self.notifiers:
             self.wake(reply)
-        self.send_json(202, {"ok": True})
+        body = {"ok": True}
+        if answered_at:
+            body.update(answeredAt=answered_at, secondAnswer=second)
+        self.send_json(202, body)
 
     def get_messages(self, ip, query):
         after, limit = paging(query)

@@ -1,0 +1,2 @@
+# The relay shrinks pictures an agent sends (lightrelay/images.py). Nothing else needs a package.
+Pillow>=11,<13

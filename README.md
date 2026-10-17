@@ -132,7 +132,11 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `PUSH_ENDPOINT` | relay | | From the Pairing screen. Without it, the phone fetches messages instead of receiving pushes. |
 | `NOTIFY_RATE_PER_HOUR` | relay | `60` | Caps a runaway agent |
 | `PUSH_TIMEOUT` | relay | `15` | Seconds |
-| `RELAY_MAX_BODY` | relay | `8192` | Bytes |
+| `RELAY_MAX_BODY` | relay | `8192` | Bytes, for everything but a /notify that can carry a picture |
+| `IMAGE_MAX_BYTES` | relay | `15728640` | A picture as sent, before shrinking (a /notify body may be 4/3 of this, for base64) |
+| `IMAGE_MAX_PIXELS` | relay | `50000000` | Refuses decompression bombs |
+| `IMAGE_MAX_WIDTH` / `IMAGE_MAX_HEIGHT` | relay | `1080` / `3600` | What a picture is shrunk to fit |
+| `IMAGE_TARGET_BYTES` | relay | `400000` | A shrunk picture stays PNG under this, else becomes a JPEG squeezed under it |
 | `REPLY_TOKEN` | inbox | *(required)* | From the Pairing screen. The first run writes a temporary one. |
 | `INBOX_RATE_PER_MIN` | inbox | `20` | Per client IP, rejected requests included |
 | `INBOX_RATE_TOTAL_PER_MIN` | inbox | `120` | Across all clients |

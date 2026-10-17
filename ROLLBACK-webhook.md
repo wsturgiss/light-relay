@@ -34,7 +34,7 @@ back out of it (AGENTS lives in agents.env now), and re-run scripts/up.sh from t
 The outbox's new `agent` column is harmless to the old code. cursor.json gains `agent:<Name>` keys, which the old code ignores.
 Bot tokens: on the box at ~/light-relay/agents/<Name>.token (chmod 600); the relay copy is in agents.env.
 
-# Rolling back the signed sender name (2026-10-16, ~23:25 EDT)
+# Rolling back the signed sender name (2026-10-16, 23:20 EDT)
 
 Deployed from branch `message-sender` (one change: /notify from a named agent adds `"from"` to the signed
 message). The image before it is tagged `light-relay:pre-sender` (named agents + Grok). Settings are unchanged.

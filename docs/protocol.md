@@ -46,7 +46,7 @@ so don't resend.
 
 One POST to the tool's UnifiedPush endpoint. The body is
 `v1.<hex HMAC-SHA256(PUSH_KEY, json)>.<json>`, where the JSON is
-`{"v":1,"id","at","headline","detail","choices"[,"ref"][,"thread"]}`. The tool drops
+`{"v":1,"id","at","headline","detail","choices"[,"ref"][,"thread"][,"from"]}`, where `from` names the agent that sent it (see docs/agents.md), so the tool can keep one channel per agent. The tool drops
 anything that doesn't verify, so knowing the endpoint isn't enough to put text on the
 phone. The request carries `TTL` and `Urgency` headers. If Light's push server needs
 more (VAPID, for example), change `push()` in `lightrelay/relay.py`.

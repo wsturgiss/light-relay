@@ -113,6 +113,12 @@ class Agents(unittest.TestCase):
             # Huginn's position stays under its IP; Jarvis gets its own key.
             self.assertEqual(json.load(f)["agents"], {"agent:Jarvis": 1})
 
+    def test_a_named_agents_message_says_who_sent_it(self):
+        self.as_agent("/notify", "POST", {"headline": "Hi"}, token=MARCUS)
+        self.as_agent("/notify", "POST", {"headline": "Hello"})                 # Huginn, by IP
+        payloads = [json.loads(b.decode().split(".", 2)[2]) for b in e2e.FakePush.received]
+        self.assertEqual([p.get("from") for p in payloads], ["Marcus Aurelius", "Huginn"])
+
     def test_unknown_token_is_refused(self):
         self.assertEqual(self.as_agent("/replies", token="x" * 40)[0], 401)
 

@@ -33,3 +33,14 @@ To keep the named agents but go back to OpenAI only: restore inbox.env from the 
 back out of it (AGENTS lives in agents.env now), and re-run scripts/up.sh from this branch.
 The outbox's new `agent` column is harmless to the old code. cursor.json gains `agent:<Name>` keys, which the old code ignores.
 Bot tokens: on the box at ~/light-relay/agents/<Name>.token (chmod 600); the relay copy is in agents.env.
+
+# Rolling back the signed sender name (2026-10-16, 23:20 EDT)
+
+Deployed from branch `message-sender` (one change: /notify from a named agent adds `"from"` to the signed
+message). The image before it is tagged `light-relay:pre-sender` (named agents + Grok). Settings are unchanged.
+
+    docker tag light-relay:pre-sender light-relay:local
+    cd /tmp && rm -rf lr-old && mkdir lr-old && git -C ~/Projects/light-relay archive grok-transcribe | tar -x -C lr-old
+    sed -i 's/^docker build .*/: # skip build/' lr-old/scripts/up.sh && lr-old/scripts/up.sh
+
+Phones keep working either way: the app reads `from` when it's there and otherwise works out the agent itself.

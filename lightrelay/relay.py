@@ -305,6 +305,9 @@ class RelayHandler(Handler):
         if "thread" in message:
             # The agent may name any message in the conversation; the phone groups by the first.
             message["thread"] = self.outbox.thread_of(message["thread"])
+        if agent:
+            # Signed with the rest, so the phone can file it in that agent's channel.
+            message["from"] = agent
 
         body = sign(message, self.push_key)
         self.outbox.add(message, body, agent)

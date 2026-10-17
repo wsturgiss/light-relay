@@ -3,6 +3,9 @@ FROM python:3.13-alpine
 # One image, two roles: ROLE=relay (tailnet-only, Serve) or ROLE=inbox (public, Funnel).
 ENV PYTHONUNBUFFERED=1 ROLE=relay DATA_DIR=/data
 WORKDIR /app
+COPY requirements.txt ./
+# Pillow, for the relay to shrink pictures; it has musllinux wheels, so no compiler.
+RUN pip install --no-cache-dir -r requirements.txt
 COPY lightrelay ./lightrelay
 
 # Unraid's usual owner for appdata: nobody:users (99:100).

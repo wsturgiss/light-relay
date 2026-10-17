@@ -3,8 +3,8 @@
 Everything on it is for the Relay Inbox tool and behind the reply token: it
 accepts replies (POST /replies) and the voice notes and photos they carry
 (PUT /attachments/<id>), and it hands back the conversation so far
-(GET /messages: the relay's signed messages, GET /replies: the replies stored
-here), so the tool can fetch messages without a push endpoint and rebuild its
+(GET /messages: the relay's signed messages, GET /images/<id>: a picture one of
+them carries, GET /replies: the replies stored here), so the tool can fetch messages without a push endpoint and rebuild its
 history. With sessions on (SESSION_HOST), it takes only short-lived session
 tokens, which the phone renews on the LAN; see session.py. Nothing can be deleted through it, and it has no route to the
 phone-pushing path. It reads the relay's outbox through a read-only mount,
@@ -25,7 +25,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from . import agents, session, transcribe, webhook
+from . import agents, images, session, transcribe, webhook
 from .agents import AGENT_NAME_RE, MAX_AGENTS, parse_agents  # noqa: F401 (inbox.parse_agents)
 from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
                      env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
@@ -315,6 +315,23 @@ def read_messages(db_path, after, limit):
     return [{"seq": r[0], "body": r[1]} for r in rows]
 
 
+def read_image(db_path, image_id):
+    """(content type, length) of a picture in the relay's outbox, or None."""
+    if not os.path.exists(db_path):
+        return None
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        db.execute("PRAGMA busy_timeout=5000")
+        return db.execute("SELECT type, bytes FROM images WHERE id = ?", (image_id,)).fetchone()
+    except sqlite3.OperationalError as e:
+        # A relay from before pictures.
+        if "no such table" in str(e):
+            return None
+        raise
+    finally:
+        db.close()
+
+
 def paging(query):
     """`after` is the last seq the tool already has; the tool keeps its own place."""
     try:
@@ -358,12 +375,15 @@ class InboxHandler(Handler):
             raise HttpError(429, "slow down")
         url = urlsplit(self.path)
         attachment = re.fullmatch(r"/attachments/([^/]+)", url.path)
+        image = re.fullmatch(r"/images/([^/]+)", url.path)
         if (method, url.path) == ("POST", "/replies"):
             handler = self.post_reply
         elif method == "PUT" and attachment:
             handler = lambda ip, _query: self.put_attachment(ip, attachment.group(1))
         elif (method, url.path) == ("GET", "/messages"):
             handler = self.get_messages
+        elif method == "GET" and image:
+            handler = lambda ip, _query: self.get_image(ip, image.group(1))
         elif (method, url.path) == ("GET", "/replies"):
             handler = self.get_replies
         elif (method, url.path) == ("GET", "/transcripts"):
@@ -412,6 +432,20 @@ class InboxHandler(Handler):
         messages = read_messages(self.outbox_db, after, limit)
         log.info("%d message(s) after %d to %s", len(messages), after, ip)
         self.send_json(200, {"messages": messages})
+
+    def get_image(self, ip, image_id):
+        """A picture from an agent's message, which the phone checks against the
+        signed message's sha256 before showing it."""
+        if not images.IMAGE_ID_RE.match(image_id):
+            raise HttpError(400, "image id must be i_ and 16 hex digits")
+        row = read_image(self.outbox_db, image_id)
+        if not row:
+            raise HttpError(404, "no such image; it may have expired")
+        try:
+            self.send_file(os.path.join(images.images_dir(self.outbox_db), image_id), row[0], row[1])
+        except FileNotFoundError:
+            raise HttpError(404, "no such image; it may have expired")
+        log.info("image %s to %s", image_id, ip)
 
     def get_replies(self, ip, query):
         after, limit = paging(query)

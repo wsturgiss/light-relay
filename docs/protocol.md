@@ -25,6 +25,32 @@ Or JSON, which can also carry choices, a reference and a thread:
 | `choices` | ≤ 4, each ≤ 24 characters |
 | `ref` | Optional, `[A-Za-z0-9_.:-]{1,64}`. Passed through to the phone. |
 | `thread` | Optional. A message id (`m_…`) or a phone-started conversation (`t_…`) to continue. |
+| `image` | Optional. A PNG or JPEG, base64 or a `data:image/…;base64,` URL. See **Pictures** below. |
+
+**Pictures.** A message can carry one picture for the phone to show under its text. In
+JSON it's `image`, base64. Or send `multipart/form-data`, as `curl -F` does: text fields
+`headline`, `detail`, `ref`, `thread`, `choice` (repeat it, up to 4), and the file as
+`image`:
+
+```bash
+curl https://<relay host>.<tailnet>.ts.net/notify -H "Authorization: Bearer $TOKEN" \
+  -F headline='Shortlist' -F detail='Six duplexes, cheapest first.' -F image=@shortlist.png
+```
+
+The relay checks the bytes really are a PNG or JPEG (`415` otherwise, `400` if it can't be
+read), takes up to `IMAGE_MAX_BYTES` (15 MB, `413` past it) and `IMAGE_MAX_PIXELS`, and
+makes it fit the phone: turned upright (EXIF), transparency flattened onto white, scaled
+down to at most 1080 × 3600 px, and saved again without metadata. A PNG stays PNG if that's
+under `IMAGE_TARGET_BYTES` (400 KB), so tables and screenshots stay crisp; anything else
+becomes a JPEG at the best quality under it. A picture that already fits and is small goes
+through untouched. The `202` gains
+`"image": {"id": "i_…", "type", "bytes", "width", "height", "sha256", "path": "/images/i_…"}`.
+
+The file is kept in `images/` next to `outbox.db` (its row in the outbox's `images` table),
+and goes when its message does. The signed message carries
+`"image": {"id", "type", "bytes", "width", "height", "sha256"}`; the push stays small, and the
+phone downloads the file from the inbox (`GET /images/<id>`) and checks its SHA-256 against
+the signed message before showing it. Older tools ignore the field and show the text.
 
 | Status | Meaning |
 |---|---|
@@ -46,7 +72,7 @@ so don't resend.
 
 One POST to the tool's UnifiedPush endpoint. The body is
 `v1.<hex HMAC-SHA256(PUSH_KEY, json)>.<json>`, where the JSON is
-`{"v":1,"id","at","headline","detail","choices"[,"ref"][,"thread"][,"from"]}`, where `from` names the agent that sent it (see docs/agents.md), so the tool can keep one channel per agent. The tool drops
+`{"v":1,"id","at","headline","detail","choices"[,"ref"][,"thread"][,"from"][,"image"]}`, where `from` names the agent that sent it (see docs/agents.md), so the tool can keep one channel per agent. The tool drops
 anything that doesn't verify, so knowing the endpoint isn't enough to put text on the
 phone. The request carries `TTL` and `Urgency` headers. If Light's push server needs
 more (VAPID, for example), change `push()` in `lightrelay/relay.py`.
@@ -68,6 +94,12 @@ own position, and reads change nothing on the server.
   the conversation after a reinstall. Reading them doesn't move the agent's cursor.
 
 Messages and replies are kept for 90 days, up to 5000 rows each.
+
+### `GET /images/<id>`
+
+A picture an agent sent with a message (`image.id` in the signed message), as
+`image/png` or `image/jpeg`, or `404` once its message has gone. The tool checks the
+bytes against the message's `image.sha256`.
 
 ### `GET /agents`
 
@@ -170,6 +202,9 @@ acknowledged cursor, oldest first:
 Each reply also carries `"attachments": [{"id": "a_…", "type": "audio/ogg", "bytes": 5004}]`,
 empty when there are none. A voice note the inbox has transcribed also has `"transcript"`, or `"transcriptError"` when it couldn't.
 
+`GET /images/<id>` returns a picture the agent sent, as the phone gets it (the
+`path` on `/notify`'s answer and on `/channel` entries), with the same peer and token rules.
+
 `GET /attachments/<id>` returns the file, with its type as `Content-Type`, or `404` once
 it has expired. With `TRANSCRIBE_API_KEY` set on the inbox, a voice note's `transcript` is on
 its attachment; without one, transcribing it is the agent's job.
@@ -195,7 +230,9 @@ Otherwise it answers `403`. It is read-only: no cursor moves.
 { "agent": "Jarvis", "total": 12, "thread": "t_…",
   "entries": [
     { "direction": "out", "kind": "message", "seq": 57, "at": "2026-10-17T03:07:23Z", "id": "m_…",
-      "thread": "m_…", "headline": "…", "detail": "…", "choices": [] },
+      "thread": "m_…", "headline": "…", "detail": "…", "choices": [],
+      "image": { "id": "i_…", "type": "image/png", "bytes": 263076, "width": 1080, "height": 639,
+                 "sha256": "…", "path": "/images/i_…" } },
     { "direction": "in", "kind": "reply", "seq": 75, "at": "2026-10-17T03:08:02Z", "id": "r_…",
       "messageId": "m_…", "thread": "m_…", "to": null, "title": null, "choice": null, "text": "…",
       "attachments": [{ "id": "a_…", "type": "audio/mp4", "bytes": 23324, "transcript": "…",

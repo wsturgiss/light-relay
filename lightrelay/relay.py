@@ -2,7 +2,8 @@
 
 The agent sends it messages for the phone (POST /notify) and collects replies
 from it (GET /replies, POST /replies/ack), and the voice notes and photos they
-carry (GET /attachments/<id>). Every route but /healthz accepts
+carry (GET /attachments/<id>). A message can carry a picture for the phone
+(see images.py), which the agent can read back at GET /images/<id>. Every route but /healthz accepts
 only the tailnet devices listed in ALLOWED_PEERS.
 
 A message is signed and kept in the outbox, where the Relay Inbox tool fetches
@@ -18,6 +19,8 @@ import os
 import re
 import secrets
 import sqlite3
+from email.parser import BytesParser
+from email.policy import HTTP
 import threading
 import time
 import urllib.error
@@ -25,7 +28,7 @@ import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
-from . import agents
+from . import agents, images
 from .agents import parse_agents
 from .common import (ATTACHMENT_ID_RE, REPLY_COLUMNS, HttpError, Handler, RateLimiter, attachment_ids, env,
                      env_int, log, parse_ips, reply_from_row, serve, setup_logging, with_transcripts)
@@ -61,8 +64,56 @@ def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def parse_multipart(content_type, body):
+    """multipart/form-data, as `curl -F` sends it: text fields headline, detail,
+    ref, thread and choice (repeated, or `choices` as a JSON list), and the
+    picture as the file field `image`. Returns (fields, image bytes or None)."""
+    try:
+        msg = BytesParser(policy=HTTP).parsebytes(
+            b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + body)
+    except (UnicodeEncodeError, ValueError):
+        raise HttpError(400, "bad multipart body")
+    if not msg.is_multipart():
+        raise HttpError(400, "bad multipart body")
+    fields, choices, image = {}, [], None
+    for part in msg.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        payload = part.get_payload(decode=True) or b""
+        if name == "image":
+            if image is not None:
+                raise HttpError(400, "one image per message")
+            image = payload
+            continue
+        try:
+            value = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HttpError(400, f"{name} must be UTF-8")
+        if name == "choice":
+            choices.append(value)
+        elif name == "choices":
+            try:
+                choices.extend(json.loads(value))
+            except (ValueError, TypeError):
+                raise HttpError(400, "choices must be a JSON list")
+        elif name in ("headline", "detail", "ref", "thread"):
+            fields[name] = value
+    fields["choices"] = choices
+    if image is not None and not image:
+        raise HttpError(400, "image is empty")
+    return fields, image
+
+
 def parse_message(content_type, body):
-    """A message is plain text (first line headline, the rest detail) or JSON."""
+    """A message is plain text (first line headline, the rest detail), JSON, or
+    multipart/form-data. JSON and multipart can carry a PNG or JPEG: JSON as
+    `image`, base64 or a data: URL. Returns (message, image bytes or None); the
+    image is checked and shrunk later (images.prepare), once the rate limit allows."""
+    image = None
+    if content_type.startswith("multipart/form-data"):
+        data, image = parse_multipart(content_type, body)
+        headline, detail, choices = data.get("headline"), data.get("detail", ""), data["choices"]
+        ref, thread = data.get("ref") or None, data.get("thread") or None
+        return _message(headline, detail, choices, ref, thread), image
     try:
         raw = body.decode("utf-8")
     except UnicodeDecodeError:
@@ -80,10 +131,15 @@ def parse_message(content_type, body):
         choices = data.get("choices", [])
         ref = data.get("ref")
         thread = data.get("thread")
+        if data.get("image") is not None:
+            image = images.decode_base64(data["image"])
     else:
         headline, _, detail = raw.strip().partition("\n")
         choices, ref, thread = [], None, None
+    return _message(headline, detail, choices, ref, thread), image
 
+
+def _message(headline, detail, choices, ref, thread):
     if not isinstance(headline, str) or not headline.strip():
         raise HttpError(400, "headline is required")
     headline = headline.strip()
@@ -142,6 +198,8 @@ class Outbox:
         self.db.execute("PRAGMA journal_mode=DELETE")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(OUTBOX_SCHEMA)
+        self.db.executescript(images.IMAGES_SCHEMA)
+        self.images_dir = images.images_dir(path)
         # Which agent sent each message, so a reply to it goes back to them.
         if "agent" not in {r[1] for r in self.db.execute("PRAGMA table_info(messages)")}:
             self.db.execute("ALTER TABLE messages ADD COLUMN agent TEXT")
@@ -149,10 +207,22 @@ class Outbox:
 
     def add(self, message, body, agent=None):
         payload = body.decode().split(".", 2)[2]
+        image = message.get("image")
         with self.lock:
+            if image:
+                self.db.execute(
+                    "INSERT INTO images (id, message_id, type, bytes, width, height, sha256, at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (image["id"], message["id"], image["type"], image["bytes"], image["width"],
+                     image["height"], image["sha256"], message["at"]))
             self.db.execute("INSERT INTO messages (id, at, payload, body, agent) VALUES (?, ?, ?, ?, ?)",
                             (message["id"], message["at"], payload, body.decode(), agent))
             self._prune()
+
+    def image(self, image_id):
+        """(content type, length) of a kept picture, or None."""
+        with self.lock:
+            return self.db.execute("SELECT type, bytes FROM images WHERE id = ?", (image_id,)).fetchone()
 
     def all(self):
         """(seq, message) for everything kept, oldest first."""
@@ -186,6 +256,17 @@ class Outbox:
         self.db.execute("DELETE FROM messages WHERE at < ?", (cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"),))
         self.db.execute(
             "DELETE FROM messages WHERE seq <= (SELECT MAX(seq) FROM messages) - ?", (MAX_ROWS,))
+        # A picture goes with its message; a file without a row is left from a failed send.
+        gone = [r[0] for r in self.db.execute(
+            "SELECT id FROM images WHERE message_id NOT IN (SELECT id FROM messages)")]
+        if gone:
+            self.db.executemany("DELETE FROM images WHERE id = ?", [(i,) for i in gone])
+        if os.path.isdir(self.images_dir):
+            kept = {r[0] for r in self.db.execute("SELECT id FROM images")}
+            cutoff = time.time() - 3600
+            gone += [f for f in os.listdir(self.images_dir) if f not in kept
+                     and os.path.getmtime(os.path.join(self.images_dir, f)) < cutoff]
+        images.remove(self.images_dir, gone)
 
 
 class Cursor:
@@ -267,6 +348,8 @@ class RelayHandler(Handler):
     cursor = None
     agent_settings = {}   # name -> settings (agents.settings)
     owners = None         # agents.Owners
+    # POST /notify with a picture (JSON or multipart). Others keep max_body.
+    max_notify_body = images.Limits.max_upload * 4 // 3 + 65536
 
     def identify(self, ip):
         """(agent name or None, cursor key). A bearer token names the agent; else a
@@ -305,14 +388,26 @@ class RelayHandler(Handler):
             return self.ack(key)
         if method == "GET" and url.path.startswith("/attachments/"):
             return self.attachment(url.path[len("/attachments/"):])
+        if method == "GET" and url.path.startswith("/images/"):
+            return self.image(url.path[len("/images/"):])
         raise HttpError(404, "not found")
 
     def notify(self, agent=None):
         if not self.push_key:
             raise HttpError(503, "not paired: set PUSH_KEY")
-        message = parse_message(self.headers.get("Content-Type", "text/plain"), self.read_body())
+        content_type = self.headers.get("Content-Type", "text/plain")
+        # Only a body that can carry a picture may be big.
+        big = content_type.startswith(("application/json", "multipart/form-data"))
+        message, image = parse_message(content_type, self.read_body(self.max_notify_body if big else None))
         if not self.notify_limit.allow("notify"):
             raise HttpError(429, "notify rate limit reached")
+        if image is not None:
+            data, image_type, width, height = images.prepare(image)
+            image_id, digest = images.store(self.outbox.images_dir, data)
+            message["image"] = {"id": image_id, "type": image_type, "bytes": len(data),
+                                "width": width, "height": height, "sha256": digest}
+            log.info("image %s for %s: %d bytes in, %dx%d %s of %d bytes kept", image_id, message["id"],
+                     len(image), width, height, image_type, len(data))
         if "thread" in message:
             # The agent may name any message in the conversation; the phone groups by the first.
             message["thread"] = self.outbox.thread_of(message["thread"])
@@ -324,8 +419,11 @@ class RelayHandler(Handler):
         self.outbox.add(message, body, agent)
         pushed = self.push(message, body) if self.push_endpoint else False
         log.info("stored %s (%s)", message["id"], "pushed" if pushed else "waiting to be fetched")
-        self.send_json(202, {"id": message["id"], "at": message["at"],
-                             "thread": message.get("thread", message["id"]), "pushed": pushed})
+        result = {"id": message["id"], "at": message["at"],
+                  "thread": message.get("thread", message["id"]), "pushed": pushed}
+        if "image" in message:
+            result["image"] = dict(message["image"], path=f"/images/{message['image']['id']}")
+        self.send_json(202, result)
 
     def push(self, message, body):
         """Best effort: a message that doesn't push still waits in the outbox,
@@ -390,6 +488,8 @@ class RelayHandler(Handler):
                      "detail": m.get("detail", ""), "choices": m.get("choices", [])}
             if m.get("ref"):
                 entry["ref"] = m["ref"]
+            if m.get("image"):
+                entry["image"] = dict(m["image"], path=f"/images/{m['image']['id']}")
             entries.append(entry)
         for r in read_replies(self.inbox_db, 0, MAX_ROWS):
             if owners.owner(r) != name:
@@ -421,6 +521,18 @@ class RelayHandler(Handler):
         except FileNotFoundError:
             # Pruned between the lookup and the open.
             raise HttpError(404, "no such attachment; it may have expired")
+
+    def image(self, image_id):
+        """A picture an agent sent with a message, as the phone gets it."""
+        if not images.IMAGE_ID_RE.match(image_id):
+            raise HttpError(400, "image id must be i_ and 16 hex digits")
+        row = self.outbox.image(image_id)
+        if not row:
+            raise HttpError(404, "no such image; it may have expired")
+        try:
+            self.send_file(os.path.join(self.outbox.images_dir, image_id), row[0], row[1])
+        except FileNotFoundError:
+            raise HttpError(404, "no such image; it may have expired")
 
     def ack(self, agent):
         data = self.read_json()
@@ -458,6 +570,13 @@ def main():
     RelayHandler.trusted_proxies = parse_ips(env("TRUSTED_PROXIES", "127.0.0.1,::1"))
     RelayHandler.client_ip_header = env("CLIENT_IP_HEADER", "X-Forwarded-For")
     RelayHandler.max_body = env_int("RELAY_MAX_BODY", 8192)
+    images.Limits.max_upload = env_int("IMAGE_MAX_BYTES", images.Limits.max_upload)
+    images.Limits.max_pixels = env_int("IMAGE_MAX_PIXELS", images.Limits.max_pixels)
+    images.Limits.max_width = env_int("IMAGE_MAX_WIDTH", images.Limits.max_width)
+    images.Limits.max_height = env_int("IMAGE_MAX_HEIGHT", images.Limits.max_height)
+    images.Limits.target_bytes = env_int("IMAGE_TARGET_BYTES", images.Limits.target_bytes)
+    # base64 is 4/3 the size, plus room for the text.
+    RelayHandler.max_notify_body = images.Limits.max_upload * 4 // 3 + 65536
 
     if not RelayHandler.push_key:
         log.warning("not paired yet: /notify will answer 503 until PUSH_KEY is set")

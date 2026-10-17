@@ -137,14 +137,18 @@ class Handler(BaseHTTPRequestHandler):
                     pass
         return peer
 
-    def read_body(self):
+    def read_body(self, limit=None):
+        limit = limit or self.max_body
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             raise HttpError(411, "Content-Length required")
-        if length < 0 or length > self.max_body:
-            raise HttpError(413, f"body over {self.max_body} bytes")
-        return self.rfile.read(length)
+        if length < 0 or length > limit:
+            raise HttpError(413, f"body over {limit} bytes")
+        data = self.rfile.read(length)
+        if len(data) != length:
+            raise HttpError(400, "body ended early")
+        return data
 
     def read_body_to(self, f, limit):
         """Copy the body into `f` without holding it in memory. Returns its length."""

@@ -119,6 +119,59 @@ class Agents(unittest.TestCase):
         payloads = [json.loads(b.decode().split(".", 2)[2]) for b in e2e.FakePush.received]
         self.assertEqual([p.get("from") for p in payloads], ["Marcus Aurelius", "Huginn"])
 
+    def channel(self, token=None, query=""):
+        status, body = self.as_agent("/channel" + query, token=token)
+        self.assertEqual(status, 200)
+        return body
+
+    def test_a_channel_is_everything_between_the_phone_and_one_agent(self):
+        q = self.as_agent("/notify", "POST", {"headline": "Groceries?", "choices": ["Yes", "No"]}, token=JARVIS)[1]["id"]
+        self.reply({"id": "r_choice", "messageId": q, "choice": "Yes"})
+        self.as_agent("/notify", "POST", {"headline": "Huginn here"})                           # someone else's
+        self.reply({"id": "r_other", "thread": "t_00000000000000bb", "text": "Hey"})             # Huginn's
+        t = "t_00000000000000aa"
+        e2e.EndToEnd.upload(self, "a_0000000000000001", e2e.VOICE)
+        inbox.InboxHandler.store.add_transcript("a_0000000000000001", "Pick up milk.")
+        self.reply({"id": "r_voice", "thread": t, "title": "Errands", "to": "jarvis", "text": "",
+                    "attachments": ["a_0000000000000001"]})
+        time.sleep(1.1)       # times are to the second; within one, the agent's messages come first
+        a = self.as_agent("/notify", "POST", {"headline": "On it", "thread": t}, token=JARVIS)[1]["id"]
+
+        got = self.channel(JARVIS)
+        self.assertEqual(got["agent"], "Jarvis")
+        self.assertEqual([(e["direction"], e["id"]) for e in got["entries"]],
+                         [("out", q), ("in", "r_choice"), ("in", "r_voice"), ("out", a)])
+        self.assertEqual([e["thread"] for e in got["entries"]], [q, q, t, t])
+        self.assertEqual(got["thread"], t)                       # where the next message continues
+        self.assertEqual(got["entries"][0]["choices"], ["Yes", "No"])
+        self.assertEqual(got["entries"][1]["messageId"], q)
+        voice = got["entries"][2]["attachments"][0]
+        self.assertEqual((voice["transcript"], voice["path"]), ("Pick up milk.", "/attachments/a_0000000000000001"))
+        times = [e["at"] for e in got["entries"]]
+        self.assertEqual(times, sorted(times))
+        # Huginn's channel, by IP: its message, and the phone start nobody was named for.
+        self.assertEqual([e["id"] for e in self.channel()["entries"]][1:], ["r_other"])
+        self.assertEqual(self.channel(MARCUS), {"agent": "Marcus Aurelius", "total": 0, "entries": [], "thread": None})
+
+    def test_a_channel_limit_keeps_the_newest_still_oldest_first(self):
+        ids = [self.as_agent("/notify", "POST", {"headline": f"n{i}"}, token=JARVIS)[1]["id"] for i in range(4)]
+        got = self.channel(JARVIS, "?limit=2")
+        self.assertEqual(([e["id"] for e in got["entries"]], got["total"]), (ids[2:], 4))
+        self.assertEqual(self.as_agent("/channel?limit=x", token=JARVIS)[0], 400)
+
+    def test_a_channel_reads_without_acknowledging(self):
+        m = self.as_agent("/notify", "POST", {"headline": "Q"}, token=JARVIS)[1]["id"]
+        self.reply({"id": "r1", "messageId": m, "text": "A"})
+        self.channel(JARVIS)
+        self.assertEqual(self.mine(JARVIS), ["r1"])
+
+    def test_a_channel_needs_a_named_agent(self):
+        old = relay.RelayHandler.agent_settings
+        self.addCleanup(setattr, relay.RelayHandler, "agent_settings", old)
+        relay.RelayHandler.agent_settings = agents.settings(NAMES, {"AGENT_JARVIS_TOKEN": JARVIS})  # no IP for Huginn
+        self.assertEqual(self.as_agent("/channel")[0], 403)
+        self.assertEqual(self.as_agent("/channel", token="x" * 40)[0], 401)
+
     def test_unknown_token_is_refused(self):
         self.assertEqual(self.as_agent("/replies", token="x" * 40)[0], 401)
 

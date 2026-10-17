@@ -19,25 +19,12 @@ reachable. Every message interrupts them.
 - **Detail:** up to 1000 characters. In practice, two or three plain sentences. No
   markdown, no links worth tapping (the phone can't open them), no tables.
 - **Choices:** when you need a decision, offer up to 4, each up to 24 characters. The
-  user can tap one, or type a reply instead.
-
-## Commands
-
-| What | Command |
-|---|---|
-| Start a conversation | `relayctl.py notify "<headline>" "<detail>" [--choice A --choice B]` |
-| Continue one | `relayctl.py notify "<headline>" "<detail>" --thread <message id>` |
-| Unhandled replies | `relayctl.py replies` |
-| Mark replies handled | `relayctl.py ack <seq>` (everything up to and including `seq`) |
-| Save a voice note or photo | `relayctl.py attachment <id> [-o <path>]` |
-
-`notify` prints `{"id": "m_…", "at": "…", "thread": "m_…", "pushed": true|false}`. Keep the `id`.
-
-## Conversations
-
-Each message either starts a conversation or continues one. On the phone, a
-conversation is one row in the inbox and one screen when the user opens it.
-
+  user can tap one, or type a reply instead. Once answered, the phone locks the choices
+  and puts a check on the pick.
+  - `--danger X` instead of `--choice X` for something hard to undo: it is shown inverted
+    and the phone asks "Are you sure?" before sending it.
+  - `--choice ID=X` names the id that comes back in the reply's `choiceIds` (default c1, c2, …).
+  - `--many`: the user picks several, then Done. `--other`: adds "Other…", a typed answer.
 - **Answering a reply? Continue its thread** with `--thread <the reply's messageId>`.
   Any message id in the conversation works; the relay finds the start.
 - **The user can start a conversation too.** It arrives in `replies` with no
@@ -66,6 +53,10 @@ conversation is one row in the inbox and one screen when the user opens it.
   **Conversations**), or added to it before you answered. Once you've answered, their
   replies carry your message's id as `messageId`, like any other reply.
 - A reply has a tapped `choice`, typed `text` or `attachments`, sometimes several.
+- Answering a question: `choiceIds` lists the ids tapped and `choice` their labels
+  (joined with ", " for `--many`). An "Other…" answer has `other: true` and the `text`.
+  `answeredAt` is when the question was first answered; `secondAnswer: true` means it
+  had been answered already (another device, or an old app): act on the first.
 
 ## Voice notes and photos
 

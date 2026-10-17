@@ -22,14 +22,32 @@ Or JSON, which can also carry choices, a reference and a thread:
 |---|---|
 | `headline` | Required, ≤ 120 characters |
 | `detail` | ≤ 1000 characters |
-| `choices` | ≤ 4, each ≤ 24 characters |
+| `choices` | ≤ 4, each ≤ 24 characters: labels, or objects `{"id", "label", "style"}` (see **Questions**) |
+| `select` | Optional. `"many"`: the user picks any of the choices, then Done. Default: one tap answers. |
+| `other` | Optional. `true` also offers "Other…", a typed answer. |
 | `ref` | Optional, `[A-Za-z0-9_.:-]{1,64}`. Passed through to the phone. |
 | `thread` | Optional. A message id (`m_…`) or a phone-started conversation (`t_…`) to continue. |
 | `image` | Optional. A PNG or JPEG, base64 or a `data:image/…;base64,` URL. See **Pictures** below. |
 
+**Questions.** A choice can be an object: `id` (`[A-Za-z0-9_-]{1,24}`, default `c1`, `c2`, …
+by position), `label` (≤ 24 characters) and `style` (`"default"` or `"danger"`; the phone
+shows a danger choice inverted and asks "Are you sure?" before sending it). Ids and labels
+are distinct. The signed message keeps `choices` as the labels, so a tool from before this
+still shows them, and adds `options: [{"id", "label", "style"}]` when an id or style differs
+from the default, plus `"select": "many"` and `"other": true` when set. `select` "many" needs
+2 or more choices; `select` and `other` need choices.
+
+```json
+{ "headline": "Clean up the old backups?", "choices": [{"id": "keep", "label": "Keep"},
+  {"id": "del", "label": "Delete all", "style": "danger"}], "other": true }
+```
+
+Once answered, the phone locks the choices and puts a check on what was picked.
+
 **Pictures.** A message can carry one picture for the phone to show under its text. In
 JSON it's `image`, base64. Or send `multipart/form-data`, as `curl -F` does: text fields
-`headline`, `detail`, `ref`, `thread`, `choice` (repeat it, up to 4), and the file as
+`headline`, `detail`, `ref`, `thread`, `choice` (repeat it, up to 4; or `choices`, a JSON
+list that may hold objects), `select`, `other` (`true`), and the file as
 `image`:
 
 ```bash
@@ -90,7 +108,7 @@ own position, and reads change nothing on the server.
 - `GET /messages` → `{"messages": [{"seq": 4, "body": "v1.<mac>.<json>"}]}`. `body` is
   byte-for-byte the push body, so the tool verifies it the same way.
 - `GET /replies` → `{"replies": [{"seq", "id", "messageId", "thread", "title", "choice",
-  "text", "sentAt", "receivedAt"}]}`. These are the tool's own replies, so it can rebuild
+  "text", "sentAt", "receivedAt", "choiceIds", "other", "answeredAt", "secondAnswer"}]}`. These are the tool's own replies, so it can rebuild
   the conversation after a reinstall. Reading them doesn't move the agent's cursor.
 
 Messages and replies are kept for 90 days, up to 5000 rows each.
@@ -126,7 +144,16 @@ Body ≤ 4 KB. Two forms:
 { "id": "r_…", "thread": "t_…", "title": "Plan Saturday", "text": "Plan Saturday\nHike or the market?", "sentAt": "…" }
 ```
 
-- A reply needs a `choice` (≤ 64 characters) or `text` (≤ 1000 characters).
+- A reply needs a `choice` (≤ 120 characters) or `text` (≤ 1000 characters).
+- Answering a question: `"choiceIds": ["del"]` (1-4 distinct, all from the message; more than
+  one only for `select` "many"), and the inbox sets `choice` to their labels in the message's
+  order, joined with ", ". Or `"other": true` with `text`, if the message offers Other.
+  The inbox checks them against the message when its outbox still has it. A `choice` without
+  ids (a tool from before this) answers too.
+- The first answer to a message sets its `answeredAt`. A later one is stored but flagged
+  `"secondAnswer": true`, with the first's `answeredAt`, and the response says so:
+  `{"ok": true, "answeredAt": "…", "secondAnswer": true}`. A resend of the first stays the first.
+  Text without `other` doesn't answer.
 - The phone generates `id`. A resend with the same `id` is stored once, so the phone can
   retry freely.
 - The second form starts a conversation from the phone. It has no `messageId`; `thread`

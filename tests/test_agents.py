@@ -124,6 +124,16 @@ class Agents(unittest.TestCase):
         self.assertEqual(status, 200)
         return body
 
+    def test_a_channel_shows_a_question_and_its_answer(self):
+        q = self.as_agent("/notify", "POST", {"headline": "Trip?", "other": True,
+                                              "choices": ["Go", {"label": "Cancel trip", "style": "danger"}]},
+                          token=JARVIS)[1]["id"]
+        self.reply({"id": "r1", "messageId": q, "choiceIds": ["c2"]})
+        out, back = self.channel(JARVIS)["entries"]
+        self.assertEqual((out["select"], out["other"], out["options"][1]["style"]), ("one", True, "danger"))
+        self.assertEqual((back["choice"], back["choiceIds"], back["secondAnswer"]), ("Cancel trip", ["c2"], False))
+        self.assertIsNotNone(back["answeredAt"])
+
     def test_a_channel_is_everything_between_the_phone_and_one_agent(self):
         q = self.as_agent("/notify", "POST", {"headline": "Groceries?", "choices": ["Yes", "No"]}, token=JARVIS)[1]["id"]
         self.reply({"id": "r_choice", "messageId": q, "choice": "Yes"})

@@ -645,7 +645,8 @@ def main():
     if api_key:
         InboxHandler.transcriber = transcribe.Transcriber(
             InboxHandler.store, api_key, env("TRANSCRIBE_URL", transcribe.DEFAULT_URL),
-            env("TRANSCRIBE_MODEL", transcribe.DEFAULT_MODEL)).start()
+            env("TRANSCRIBE_MODEL", transcribe.DEFAULT_MODEL),
+            keyterms_file=env("STT_KEYTERMS_FILE", f"{data_dir}/stt-keyterms.txt")).start()
         log.info("transcribing voice notes with %s at %s", InboxHandler.transcriber.model, InboxHandler.transcriber.url)
     else:
         log.info("no TRANSCRIBE_API_KEY: voice notes go through without transcripts")

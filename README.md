@@ -148,6 +148,7 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `TRANSCRIBE_API_KEY` | inbox | | Turns on voice-note transcripts (see **Voice transcripts**). An OpenAI key by default. |
 | `TRANSCRIBE_URL` | inbox | `https://api.openai.com/v1/audio/transcriptions` | Any OpenAI-compatible endpoint, e.g. Groq's `https://api.groq.com/openai/v1/audio/transcriptions` |
 | `TRANSCRIBE_MODEL` | inbox | `gpt-4o-mini-transcribe` | `whisper-large-v3-turbo` on Groq, `grok-voice-transcribe-2.0` on xAI (`TRANSCRIBE_URL=https://api.x.ai/v1/stt`) |
+| `STT_KEYTERMS_FILE` | inbox | `/data/stt-keyterms.txt` | Names and jargon to spell right, one per line (`#` comments; max 100, each up to 50 chars). Sent to xAI `/v1/stt` as `keyterm` fields with `language=en` and `format=true`; re-read on change. No file, no extra fields. Example: `examples/stt-keyterms.txt` |
 | `SESSION_HOST` | inbox | | This host's LAN IP. Turns on short-lived sessions (see **Security**). |
 | `SESSION_PORT` | inbox | `18443` | The LAN-only session door |
 | `SESSION_TTL_HOURS` | inbox | `72` | How long a session lasts away from home |

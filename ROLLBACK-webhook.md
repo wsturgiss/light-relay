@@ -55,3 +55,11 @@ is tagged `light-relay:pre-channel` (the signed sender name). Settings are uncha
     sed -i 's/^docker build .*/: # skip build/' lr-old/scripts/up.sh && lr-old/scripts/up.sh
 
 Without it, `~/light-relay/channel.sh` on the box gets 404 from /channel. Everything else keeps working.
+
+## STT keyterms (stt-keyterms)
+
+Live file: ~/.local/share/light-relay/inbox/stt-keyterms.txt (the inbox's /data). Deleting or emptying it
+returns transcription requests to exactly what they were, no restart needed. To go back to the image before:
+
+    docker tag light-relay:pre-keyterms light-relay:local
+    sed 's/^docker build .*/: # skip build/' ~/Projects/lr-questions/scripts/up.sh > /tmp/up-nobuild.sh && bash /tmp/up-nobuild.sh

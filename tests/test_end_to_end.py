@@ -223,24 +223,14 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(json.loads(payload)["headline"], "before new keys")
         self.assertEqual(relay.RelayHandler.outbox.resign(new_key), 0)
 
-    def test_a_follow_up_joins_the_first_messages_thread(self):
+    def test_a_thread_from_an_older_agent_is_accepted_and_ignored(self):
         first = self.notify("Tailnet test")
-        self.assertEqual(first["thread"], first["id"])
-        second = request(self.relay_url + "/notify", "POST",
-                         {"headline": "Got your Got it", "thread": first["id"]}, via=AGENT_IP)[1]
-        # Naming the second message still lands in the first one's thread.
-        third = request(self.relay_url + "/notify", "POST",
-                        {"headline": "And again", "thread": second["id"]}, via=AGENT_IP)[1]
-        self.assertEqual((second["thread"], third["thread"]), (first["id"], first["id"]))
+        for thread in (first["id"], "m_00000000000000ff", "not-an-id"):
+            status, body = request(self.relay_url + "/notify", "POST",
+                                   {"headline": "Got your Got it", "thread": thread}, via=AGENT_IP)
+            self.assertEqual((status, "thread" in body), (202, False))
         pushed = [json.loads(b.decode().split(".", 2)[2]) for b in FakePush.received]
-        self.assertEqual([m.get("thread") for m in pushed], [None, first["id"], first["id"]])
-
-    def test_unknown_thread_starts_its_own(self):
-        status, body = request(self.relay_url + "/notify", "POST",
-                               {"headline": "hi", "thread": "m_00000000000000ff"}, via=AGENT_IP)
-        self.assertEqual((status, body["thread"]), (202, "m_00000000000000ff"))
-        self.assertEqual(request(self.relay_url + "/notify", "POST",
-                                 {"headline": "hi", "thread": "not-an-id"}, via=AGENT_IP)[0], 400)
+        self.assertEqual([m.get("thread") for m in pushed], [None] * 4)
 
     def test_unpaired_relay_answers_503(self):
         relay.RelayHandler.push_key = None
@@ -306,32 +296,26 @@ class EndToEnd(unittest.TestCase):
         for via in (AGENT_IP, OTHER_AGENT_IP):
             self.assertEqual([r["id"] for r in request(self.relay_url + "/replies", via=via)[1]["replies"]], ["r2"])
 
-    def test_conversation_started_on_the_phone_reaches_the_agent_and_back(self):
+    def test_a_phone_start_from_an_older_phone_still_arrives(self):
         start = {"id": "r_start", "thread": "t_0123456789abcdef", "title": "Plan Saturday",
                  "text": "Plan Saturday\nHike or the market?"}
         self.assertEqual(self.reply(start)[0], 202)
         got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
-        self.assertEqual((got["thread"], got["title"], got["messageId"]),
-                         ("t_0123456789abcdef", "Plan Saturday", None))
-        answer = request(self.relay_url + "/notify", "POST",
-                         {"headline": "Hike", "thread": got["thread"]}, via=AGENT_IP)[1]
-        self.assertEqual(answer["thread"], "t_0123456789abcdef")
-        # The phone can read its own start back to rebuild the conversation.
-        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["title"], "Plan Saturday")
+        self.assertEqual((got["text"], got["messageId"], "thread" in got, "title" in got),
+                         ("Plan Saturday\nHike or the market?", None, False, False))
 
-    def test_conversation_from_the_phone_names_its_agent(self):
+    def test_a_reply_names_its_agent(self):
         inbox.InboxHandler.agents = ("Huginn", "Claude")
         self.addCleanup(setattr, inbox.InboxHandler, "agents", ())
         self.assertEqual(self.fetch("/agents")[1], {"agents": ["Huginn", "Claude"]})
-        start = {"id": "r_start", "thread": "t_0123456789abcdef", "title": "Plan Saturday",
-                 "text": "Plan Saturday", "to": "claude"}
-        self.assertEqual(self.reply(start)[0], 202)
+        self.assertEqual(self.reply({"id": "r1", "text": "Plan Saturday", "to": "claude"})[0], 202)
+        # A choice names its agent too, and still says which question it answers.
+        self.assertEqual(self.reply({"id": "r2", "messageId": "m_1", "choice": "Yes", "to": "Claude"})[0], 202)
         # Spelled as configured, for the agent and for the phone's history.
-        self.assertEqual(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]["to"], "Claude")
-        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["to"], "Claude")
-        # Only a conversation started on the phone has a recipient; an answer to a message doesn't.
-        self.assertEqual(self.reply({"id": "r2", "messageId": "m_1", "text": "x", "to": "Claude"})[0], 400)
-        self.assertEqual(self.reply({"id": "r3", "thread": "t_0123456789abcdef", "text": "x", "to": "<b>"})[0], 400)
+        self.assertEqual([r["to"] for r in request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"]],
+                         ["Claude", "Claude"])
+        self.assertEqual(self.fetch("/replies")[1]["replies"][1]["messageId"], "m_1")
+        self.assertEqual(self.reply({"id": "r3", "text": "x", "to": "<b>"})[0], 400)
 
     def test_replies_without_a_recipient_say_so(self):
         self.reply({"id": "r1", "messageId": "m_1", "choice": "Yes"})
@@ -345,11 +329,10 @@ class EndToEnd(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 inbox.parse_agents(bad)
 
-    def test_bad_thread_or_title_is_rejected(self):
-        for body in ({"id": "r1", "text": "x", "thread": "m_0123456789abcdef"},
-                     {"id": "r1", "text": "x", "title": "no thread"},
-                     {"id": "r1", "text": "x", "thread": "t_0123456789abcdef", "title": "x" * 121}):
-            self.assertEqual(self.reply(body)[0], 400, body)
+    def test_a_legacy_thread_or_title_is_ignored(self):
+        for n, body in enumerate(({"text": "x", "thread": "m_0123456789abcdef"}, {"text": "x", "title": "no thread"},
+                                  {"text": "x", "thread": "t_0123456789abcdef", "title": "x" * 121})):
+            self.assertEqual(self.reply({"id": f"r{n}", **body})[0], 202, body)
 
     def test_older_reply_database_gains_the_new_columns(self):
         path = f"{self.tmp.name}/old.db"
@@ -362,7 +345,7 @@ class EndToEnd(unittest.TestCase):
         old.close()
         store = inbox.ReplyStore(path)
         try:
-            self.assertEqual((store.since(0, 10)[0]["thread"], store.since(0, 10)[0]["attachments"]),
+            self.assertEqual((store.since(0, 10)[0]["to"], store.since(0, 10)[0]["attachments"]),
                              (None, []))
         finally:
             store.db.close()

@@ -38,9 +38,6 @@ MAX_CHOICE_IDS = 4
 RETAIN_DAYS = 90
 MAX_ROWS = 5000
 MAX_FETCH = 100
-MAX_TITLE = 120
-# A conversation started on the phone. The agent continues it with notify's `thread`.
-THREAD_RE = re.compile(r"^t_[0-9a-f]{16}$")
 MAX_ATTACHMENTS = 4
 
 
@@ -231,7 +228,7 @@ class ReplyStore:
                 " (id, message_id, thread, title, choice, text, sent_at, received_at, attachments, to_agent,"
                 " choice_ids, other, answered_at, second_answer)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (reply["id"], reply.get("messageId"), reply.get("thread"), reply.get("title"),
+                (reply["id"], reply.get("messageId"), None, None,
                  reply.get("choice"), reply.get("text"), reply.get("sentAt"), now,
                  json.dumps(reply["attachments"]) if reply.get("attachments") else None, reply.get("to"),
                  json.dumps(reply["choiceIds"]) if reply.get("choiceIds") else None,
@@ -356,23 +353,17 @@ def validate(data, store, agents=(), outbox_db=None):
     sent_at = data.get("sentAt")
     if sent_at is not None and (not isinstance(sent_at, str) or len(sent_at) > 40):
         raise HttpError(400, "bad sentAt")
-    thread = data.get("thread")
-    if thread is not None and (not isinstance(thread, str) or not THREAD_RE.match(thread)):
-        raise HttpError(400, "thread must be t_ and 16 hex digits")
-    title = data.get("title")
-    if title is not None and (not isinstance(title, str) or len(title) > MAX_TITLE):
-        raise HttpError(400, f"title must be a string of at most {MAX_TITLE} chars")
-    if title and not thread:
-        raise HttpError(400, "a title starts a conversation, so it needs a thread")
+    # `thread` and `title`, from a phone that started separate conversations, are ignored:
+    # there's one conversation per agent, and `to` says whose.
     to = data.get("to")
     if to is not None:
-        if not isinstance(to, str) or not thread or message_id:
-            raise HttpError(400, "to names who a conversation started on the phone is for, so it needs a thread")
+        if not isinstance(to, str):
+            raise HttpError(400, "to must be an agent's name")
         # One of AGENTS, spelled as configured. A name since removed is kept as sent.
         to = next((a for a in agents if a.lower() == to.lower()), to)
         if not AGENT_NAME_RE.match(to):
             raise HttpError(400, "to must be an agent's name")
-    return {"id": reply_id, "messageId": message_id, "thread": thread, "title": title or None,
+    return {"id": reply_id, "messageId": message_id,
             "choice": choice or None, "text": text or None, "sentAt": sent_at,
             "attachments": attachments, "to": to, "choiceIds": choice_ids, "other": other}
 

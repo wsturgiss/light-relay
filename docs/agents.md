@@ -2,16 +2,17 @@
 
 Several agents can share the phone. Each one:
 
-- shows up under **To** when Will starts a conversation (`GET /agents`, from `AGENTS`),
+- has one conversation on the phone (`GET /agents`, from `AGENTS`),
 - reads only the replies that are for it (`GET /replies`) and acknowledges them for itself (`POST /replies/ack`),
 - is woken by its own webhook when a reply for it arrives.
 
 ## Who a reply is for
 
-1. The agent it names: `to`, which the phone sends on a conversation it started until an agent answers.
-2. The agent that sent the message it answers. The relay records the sender of every `/notify`.
-3. For a phone conversation (`t_…`), the agent it was started for.
-4. Otherwise the default agent, which is the first in `AGENTS`. Replies to messages sent before senders were recorded belong to the default agent.
+1. The agent it names: `to`, the conversation it was written in. The phone sends it on every reply, and it wins over anything else the reply carries.
+2. From a phone that predates `to` on every reply: the agent that sent the message it answers (`messageId`). The relay records the sender of every `/notify`.
+3. Otherwise the default agent, which is the first in `AGENTS`. Replies to messages sent before senders were recorded, or by an agent without a name, belong to the default agent.
+
+There are no threads. A `thread` on `/notify`, or a `thread` or `title` on a reply, from a caller written before this, is accepted and ignored.
 
 ## How an agent is known to the relay
 

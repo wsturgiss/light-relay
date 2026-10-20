@@ -12,16 +12,15 @@ other than letters and digits as `_` (Marcus Aurelius -> AGENT_MARCUS_AURELIUS_*
     AGENT_<NAME>_WEBHOOK_URL  POSTed {"newest_seq": n, "to": "<name>"} by the inbox
     AGENT_<NAME>_WEBHOOK_KEY  when a reply for this agent arrives.
 
-A reply is for:
-  1. the agent it names (`to`, set on a conversation started on the phone), else
-  2. the agent that sent the message it answers (recorded in the outbox), else
-  3. for a phone conversation (t_...), the agent the conversation was started for,
-  4. otherwise the default agent: the first in AGENTS. Messages sent before the
-     outbox recorded senders belong to the default agent.
+The phone has one conversation per agent, and a reply is for:
+  1. the agent it names (`to`: the conversation it was written in), else
+  2. from a phone that predates `to` on every reply, the agent that sent the
+     message it answers (recorded in the outbox), else
+  3. the default agent: the first in AGENTS. Messages sent before the outbox
+     recorded senders, or by an agent without a name, belong to the default agent.
 """
 
 import functools
-import json
 import os
 import re
 import sqlite3
@@ -87,8 +86,8 @@ def query(path, sql, args):
 
 
 class Owners:
-    """Decides who a reply is for, from the outbox (who sent what) and the inbox
-    (who a phone conversation was started for)."""
+    """Decides who a reply is for: the agent it names, else (from an older phone)
+    whoever the outbox says sent the message it answers."""
 
     def __init__(self, names, outbox_db, inbox_db):
         self.names = tuple(names)
@@ -97,15 +96,14 @@ class Owners:
 
     def cached(self):
         """A copy that remembers each lookup, for one request that asks about many
-        replies (GET /channel). Same answers; each message or thread is read once."""
+        replies (GET /channel). Same answers; each message is read once."""
         copy = Owners(self.names, self.outbox_db, self.inbox_db)
         copy.message_agent = functools.lru_cache(maxsize=None)(copy.message_agent)
-        copy.thread_agent = functools.lru_cache(maxsize=None)(copy.thread_agent)
         return copy
 
     def message_owner(self, message_id):
         """The agent a sent message belongs to, as the phone files it: who sent it,
-        else who its conversation is for, else the default agent."""
+        else the default agent."""
         try:
             found = self.message_agent(message_id)
         except sqlite3.Error as e:
@@ -120,37 +118,17 @@ class Owners:
     def canonical(self, name):
         return next((a for a in self.names if a.lower() == name.lower()), name)
 
-    def message_agent(self, message_id, depth=0):
-        rows = query(self.outbox_db, "SELECT agent, payload FROM messages WHERE id = ?", (message_id,))
-        if not rows:
-            return None
-        agent, payload = rows[0]
-        if agent:
-            return agent
-        try:
-            thread = json.loads(payload).get("thread")
-        except ValueError:
-            thread = None
-        if thread and thread != message_id and depth < 3:
-            return self.thread_agent(thread, depth + 1)
-        return None
-
-    def thread_agent(self, thread, depth=0):
-        if thread.startswith("t_"):
-            rows = query(self.inbox_db, "SELECT to_agent FROM replies WHERE thread = ? AND to_agent IS NOT NULL"
-                         " ORDER BY seq LIMIT 1", (thread,))
-            return rows[0][0] if rows else None
-        return self.message_agent(thread, depth)
+    def message_agent(self, message_id):
+        rows = query(self.outbox_db, "SELECT agent FROM messages WHERE id = ?", (message_id,))
+        return rows[0][0] if rows else None
 
     def owner(self, reply):
         try:
             if reply.get("to"):
                 return self.canonical(reply["to"])
-            for ref, lookup in ((reply.get("messageId"), self.message_agent), (reply.get("thread"), self.thread_agent)):
-                if ref:
-                    found = lookup(ref)
-                    if found:
-                        return self.canonical(found)
+            found = reply.get("messageId") and self.message_agent(reply["messageId"])
+            if found:
+                return self.canonical(found)
         except sqlite3.Error as e:
             log.warning("couldn't tell who reply %s is for: %s", reply.get("id"), e)
         return self.default

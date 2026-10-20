@@ -98,13 +98,13 @@ its tailnet IP.
    ```bash
    export RELAY_URL=https://<host>.<tailnet>.ts.net
    relayctl.py notify "Book the 9:40?" "Holds expire at noon." --choice Yes --choice No
-   # {"id": "m_691c2570d10b8b8a", "at": "…", "thread": "m_691c2570d10b8b8a", "pushed": true}
+   # {"id": "m_691c2570d10b8b8a", "at": "…", "pushed": true}
    relayctl.py replies       # unacknowledged replies, as JSON
    relayctl.py ack <seq>     # after acting on them
    ```
 
-- **Answer a reply in its conversation** with `--thread <its messageId>`. Without
-  `--thread`, the message starts a new conversation on the phone.
+- **Each agent has one conversation on the phone.** Everything it sends lands there, and
+  what Will writes there comes back to it. There are no threads.
 - **Acknowledge only what you've acted on.** Unacknowledged replies come back on the next
   check, so a crash can't lose one.
 - **Don't resend when `pushed` is `false`.** The message is stored, and the phone fetches it
@@ -144,7 +144,7 @@ Settings go in `relay.env` and `inbox.env` in the state directory.
 | `ATTACHMENT_MAX_BYTES` | inbox | `10485760` | Bytes per voice note or photo |
 | `ATTACHMENT_MAX_TOTAL` | inbox | `524288000` | Bytes kept in all; the oldest go first |
 | `ATTACHMENT_RETAIN_DAYS` | inbox | `30` | Shorter than the 90 days replies are kept |
-| `AGENTS` | inbox | | Names, comma-separated, the default first, e.g. `Huginn,Claude`. The phone asks which one a new conversation is for. |
+| `AGENTS` | inbox | | Names, comma-separated, the default first, e.g. `Huginn,Claude`. The phone shows one conversation for each. |
 | `TRANSCRIBE_API_KEY` | inbox | | Turns on voice-note transcripts (see **Voice transcripts**). An OpenAI key by default. |
 | `TRANSCRIBE_URL` | inbox | `https://api.openai.com/v1/audio/transcriptions` | Any OpenAI-compatible endpoint, e.g. Groq's `https://api.groq.com/openai/v1/audio/transcriptions` |
 | `TRANSCRIBE_MODEL` | inbox | `gpt-4o-mini-transcribe` | `whisper-large-v3-turbo` on Groq, `grok-voice-transcribe-2.0` on xAI (`TRANSCRIBE_URL=https://api.x.ai/v1/stt`) |

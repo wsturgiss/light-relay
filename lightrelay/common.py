@@ -45,7 +45,8 @@ def attachment_ids(replies):
 
 
 def reply_from_row(r):
-    return {"seq": r[0], "id": r[1], "messageId": r[2], "thread": r[3], "title": r[4],
+    # r[3], r[4]: thread and title, kept on rows from before one conversation per agent.
+    return {"seq": r[0], "id": r[1], "messageId": r[2],
             "choice": r[5], "text": r[6], "sentAt": r[7], "receivedAt": r[8],
             "attachments": json.loads(r[9]) if r[9] else [], "to": r[10],
             # Answering a question: the ids tapped, whether it's the free-text "Other",

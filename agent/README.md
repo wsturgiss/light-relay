@@ -25,33 +25,27 @@ reachable. Every message interrupts them.
     and the phone asks "Are you sure?" before sending it.
   - `--choice ID=X` names the id that comes back in the reply's `choiceIds` (default c1, c2, …).
   - `--many`: the user picks several, then Done. `--other`: adds "Other…", a typed answer.
-- **Answering a reply? Continue its thread** with `--thread <the reply's messageId>`.
-  Any message id in the conversation works; the relay finds the start.
-- **The user can start a conversation too.** It arrives in `replies` with no
-  `messageId`, a `thread` (`t_…`) and a `title` (their first line). Answer with
-  `--thread <that thread>`, and keep using it for the rest of the conversation.
-- **Check `to` on a conversation the user started.** It names the agent they picked
+- **You have one conversation on the phone.** Everything you send lands in it, and what
+  the user writes in it comes back to you. There are no threads: just `notify`. (`--thread`
+  is still accepted, and ignored, so older scripts keep working.)
+- **Check `to` on each reply.** It names the agent whose conversation it was written in
   (the relay's `AGENTS`). Take only the ones addressed to you. With no `to` (an older
   phone, or `AGENTS` unset), agree with the other agents who takes them.
-- **New subject? Leave `--thread` off.**
-- Don't open a new conversation for a follow-up. It shows up on the phone as an
-  unrelated message.
 
 ## Replies
 
 `relayctl.py replies` returns a JSON list, oldest first:
 
 ```json
-[{ "seq": 8, "id": "r_…", "messageId": "m_356f72d08c65d0ee", "thread": null, "title": null,
+[{ "seq": 8, "id": "r_…", "messageId": "m_356f72d08c65d0ee", "to": "Huginn",
    "choice": "Nice", "text": null, "sentAt": "2026-10-05T04:41:02Z", "receivedAt": "2026-10-05T04:41:02Z" },
- { "seq": 9, "id": "r_…", "messageId": null, "thread": "t_8c1f0a2b3d4e5f60", "title": "Plan Saturday",
-   "choice": null, "text": "Plan Saturday\nHike or the market?", "sentAt": "…", "receivedAt": "…" }]
+ { "seq": 9, "id": "r_…", "messageId": null, "to": "Huginn",
+   "choice": null, "text": "Hike or the market?", "sentAt": "…", "receivedAt": "…" }]
 ```
 
-- `messageId` is the message being answered. Match it to the `id` you kept.
-- No `messageId` but a `thread`: the user started a conversation (see
-  **Conversations**), or added to it before you answered. Once you've answered, their
-  replies carry your message's id as `messageId`, like any other reply.
+- `to` is whose conversation it was written in.
+- `messageId` is set only on an answer to one of your questions: the question it answers.
+  Match it to the `id` you kept. Typed text, voice notes and photos have none.
 - A reply has a tapped `choice`, typed `text` or `attachments`, sometimes several.
 - Answering a question: `choiceIds` lists the ids tapped and `choice` their labels
   (joined with ", " for `--many`). An "Other…" answer has `other: true` and the `text`.
@@ -70,14 +64,14 @@ reply, with no `text`.
   as `"transcript"` on the attachment, a few seconds after the note arrives. If it's
   missing, check again shortly, or transcribe the note yourself. If neither works, tell
   the user you got a voice note you couldn't listen to; don't guess.
-- **Photos:** look at it. Answer about what's in it, in the same thread.
+- **Photos:** look at it. Answer about what's in it.
 - Fetch them when the reply arrives. They're kept 30 days, then `attachment` fails with
   a `404`.
 - **Act first, then `ack`.** Anything not acknowledged comes back next time, so a crash
   between the two can't lose a reply. Don't `ack` past a reply you haven't handled, and
   don't use `replies --ack`, which acknowledges everything it prints.
 - **Other agents may use the same relay.** You see replies to their messages too. Skip
-  any whose `messageId` or `thread` isn't one you sent, and `ack` past them freely: your
+  any whose `to` isn't you, and `ack` past them freely: your
   acknowledgements move only your own position, never theirs.
 - A reply can arrive minutes or hours later. Check on a schedule.
 

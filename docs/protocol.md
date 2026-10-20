@@ -12,7 +12,7 @@ curl -X POST https://<relay host>.<tailnet>.ts.net/notify -H 'Content-Type: text
   --data-binary $'Relay test\nThis is a test message.'
 ```
 
-Or JSON, which can also carry choices, a reference and a thread:
+Or JSON, which can also carry choices and a reference:
 
 ```json
 { "headline": "Book the 9:40?", "detail": "Holds expire at noon.", "choices": ["Yes", "No"], "ref": "trip-42" }
@@ -26,7 +26,7 @@ Or JSON, which can also carry choices, a reference and a thread:
 | `select` | Optional. `"many"`: the user picks any of the choices, then Done. Default: one tap answers. |
 | `other` | Optional. `true` also offers "Other…", a typed answer. |
 | `ref` | Optional, `[A-Za-z0-9_.:-]{1,64}`. Passed through to the phone. |
-| `thread` | Optional. A message id (`m_…`) or a phone-started conversation (`t_…`) to continue. |
+| `thread` | Ignored. From before one conversation per agent; accepted so older callers still work. |
 | `image` | Optional. A PNG or JPEG, base64 or a `data:image/…;base64,` URL. See **Pictures** below. |
 
 **Questions.** A choice can be an object: `id` (`[A-Za-z0-9_-]{1,24}`, default `c1`, `c2`, …
@@ -46,7 +46,7 @@ Once answered, the phone locks the choices and puts a check on what was picked.
 
 **Pictures.** A message can carry one picture for the phone to show under its text. In
 JSON it's `image`, base64. Or send `multipart/form-data`, as `curl -F` does: text fields
-`headline`, `detail`, `ref`, `thread`, `choice` (repeat it, up to 4; or `choices`, a JSON
+`headline`, `detail`, `ref`, `choice` (repeat it, up to 4; or `choices`, a JSON
 list that may hold objects), `select`, `other` (`true`), and the file as
 `image`:
 
@@ -72,15 +72,15 @@ the signed message before showing it. Older tools ignore the field and show the 
 
 | Status | Meaning |
 |---|---|
-| `202` | Stored: `{"id": "m_…", "at": "…", "thread": "m_…", "pushed": true}` |
+| `202` | Stored: `{"id": "m_…", "at": "…", "pushed": true}` |
 | `400` | The message broke a limit. The error says which. |
 | `403` | The caller isn't in `ALLOWED_PEERS`. |
 | `429` | Over `NOTIFY_RATE_PER_HOUR`. |
 | `503` | Not paired: `PUSH_KEY` isn't set. |
 
-**Threads.** A message without `thread` starts a conversation, and its own id is the
-thread. The relay resolves any `m_…` id you name to the conversation's first message,
-so naming the message a reply was about is always correct.
+**One conversation per agent.** Everything an agent sends lands in its one conversation
+on the phone (named by `from`; an agent without a name is the default agent's). There
+are no threads to continue or start.
 
 **`pushed`** is `false` when there is no `PUSH_ENDPOINT` or the push server refused the
 message (the relay logs why). The message is stored either way and the phone fetches it,
@@ -90,7 +90,7 @@ so don't resend.
 
 One POST to the tool's UnifiedPush endpoint. The body is
 `v1.<hex HMAC-SHA256(PUSH_KEY, json)>.<json>`, where the JSON is
-`{"v":1,"id","at","headline","detail","choices"[,"ref"][,"thread"][,"from"][,"image"]}`, where `from` names the agent that sent it (see docs/agents.md), so the tool can keep one channel per agent. The tool drops
+`{"v":1,"id","at","headline","detail","choices"[,"ref"][,"from"][,"image"]}`, where `from` names the agent that sent it (see docs/agents.md), so the tool can keep one channel per agent. The tool drops
 anything that doesn't verify, so knowing the endpoint isn't enough to put text on the
 phone. The request carries `TTL` and `Urgency` headers. If Light's push server needs
 more (VAPID, for example), change `push()` in `lightrelay/relay.py`.
@@ -107,7 +107,7 @@ own position, and reads change nothing on the server.
 
 - `GET /messages` → `{"messages": [{"seq": 4, "body": "v1.<mac>.<json>"}]}`. `body` is
   byte-for-byte the push body, so the tool verifies it the same way.
-- `GET /replies` → `{"replies": [{"seq", "id", "messageId", "thread", "title", "choice",
+- `GET /replies` → `{"replies": [{"seq", "id", "messageId", "to", "choice",
   "text", "sentAt", "receivedAt", "choiceIds", "other", "answeredAt", "secondAnswer"}]}`. These are the tool's own replies, so it can rebuild
   the conversation after a reinstall. Reading them doesn't move the agent's cursor.
 
@@ -137,12 +137,20 @@ on the attachment, once there is one. Kept 90 days, past the audio's 30.
 
 ### `POST /replies`
 
-Body ≤ 4 KB. Two forms:
+Body ≤ 4 KB. Something written in an agent's conversation, and a tapped answer to one of its questions:
 
 ```json
-{ "id": "r_…", "messageId": "m_…", "choice": "Yes", "text": null, "sentAt": "…" }
-{ "id": "r_…", "thread": "t_…", "title": "Plan Saturday", "text": "Plan Saturday\nHike or the market?", "sentAt": "…" }
+{ "id": "r_…", "to": "Huginn", "text": "Hike or the market?", "sentAt": "…" }
+{ "id": "r_…", "to": "Huginn", "messageId": "m_…", "choice": "Yes", "sentAt": "…" }
 ```
+
+- `to` is the agent whose conversation it was written in, picked from `GET /agents`, and
+  it decides who the reply is for. A name in `AGENTS` comes back spelled as configured.
+  Without `to` (a phone from before this), the reply is for whoever sent `messageId`, else
+  the default agent.
+- `messageId` is only for answering a question: it says which one. It never routes a reply
+  that has `to`.
+- `thread` and `title`, from a phone that started separate conversations, are ignored.
 
 - A reply needs a `choice` (≤ 120 characters) or `text` (≤ 1000 characters).
 - Answering a question: `"choiceIds": ["del"]` (1-4 distinct, all from the message; more than
@@ -156,14 +164,7 @@ Body ≤ 4 KB. Two forms:
   Text without `other` doesn't answer.
 - The phone generates `id`. A resend with the same `id` is stored once, so the phone can
   retry freely.
-- The second form starts a conversation from the phone. It has no `messageId`; `thread`
-  (`t_` and 16 hex digits) is the new conversation's id, and `title` (≤ 120 characters)
-  is its first line. The agent answers with `notify` and that `thread`.
-- The second form can carry `"to": "Huginn"`: which agent the conversation is for, picked
-  on the phone from `GET /agents`. It's on every reply in the conversation until an agent
-  answers; after that, `messageId` says whose it is. A name in `AGENTS` comes back spelled
-  as configured. Without `to`, the conversation is unaddressed.
-- Either form can carry `"attachments": ["a_…"]`: up to 4 voice notes or photos,
+- A reply can carry `"attachments": ["a_…"]`: up to 4 voice notes or photos,
   uploaded first. A reply with attachments needs no `choice` or `text`. Naming one that
   hasn't been uploaded is a `400`, so upload it and send the reply again.
 
@@ -222,7 +223,7 @@ is for one phone.
 acknowledged cursor, oldest first:
 
 ```json
-{ "replies": [{ "seq": 3, "id": "r_…", "messageId": "m_…", "thread": null, "title": null,
+{ "replies": [{ "seq": 3, "id": "r_…", "messageId": "m_…", "to": "Jarvis",
                 "choice": "Yes", "text": null, "sentAt": "…", "receivedAt": "…" }], "cursor": 2 }
 ```
 
@@ -254,14 +255,14 @@ newest n, still oldest first. It needs a named agent (a token, or an `AGENT_<NAM
 Otherwise it answers `403`. It is read-only: no cursor moves.
 
 ```json
-{ "agent": "Jarvis", "total": 12, "thread": "t_…",
+{ "agent": "Jarvis", "total": 12,
   "entries": [
     { "direction": "out", "kind": "message", "seq": 57, "at": "2026-10-17T03:07:23Z", "id": "m_…",
-      "thread": "m_…", "headline": "…", "detail": "…", "choices": [],
+      "headline": "…", "detail": "…", "choices": [],
       "image": { "id": "i_…", "type": "image/png", "bytes": 263076, "width": 1080, "height": 639,
                  "sha256": "…", "path": "/images/i_…" } },
     { "direction": "in", "kind": "reply", "seq": 75, "at": "2026-10-17T03:08:02Z", "id": "r_…",
-      "messageId": "m_…", "thread": "m_…", "to": null, "title": null, "choice": null, "text": "…",
+      "messageId": null, "to": "Jarvis", "choice": null, "text": "…",
       "attachments": [{ "id": "a_…", "type": "audio/mp4", "bytes": 23324, "transcript": "…",
                         "path": "/attachments/a_…" }],
       "sentAt": "…", "receivedAt": "…" } ] }
@@ -269,10 +270,7 @@ Otherwise it answers `403`. It is read-only: no cursor moves.
 
 `seq` is the outbox's for `out` entries and the inbox's for `in` ones (the same `seq` as
 `/replies` and `/replies/ack`). `at` is UTC, to the second: when the relay stored the message or received
-the reply. Within one second, messages come before replies. `thread` is each entry's
-conversation (its first message, or the phone's `t_…`). The top-level `thread` is the newest
-entry's, so `POST /notify {"headline": …, "thread": <that>}` continues where the channel left
-off.
+the reply. Within one second, messages come before replies.
 
 `GET /healthz` → `{"ok": true, "paired": <PUSH_KEY set>, "push": <PUSH_ENDPOINT set>}`. It
 is the only relay route open to every tailnet device.

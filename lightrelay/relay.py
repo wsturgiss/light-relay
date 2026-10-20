@@ -40,8 +40,6 @@ MAX_CHOICE = 24
 CHOICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
 CHOICE_STYLES = ("default", "danger")
 REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
-# A message the relay sent (m_), or a conversation started on the phone (t_).
-THREAD_ID_RE = re.compile(r"^[mt]_[0-9a-f]{16}$")
 RETAIN_DAYS = 90
 # How many replies one /replies call looks through for a named agent's own.
 SCAN_LIMIT = 5000
@@ -68,7 +66,7 @@ def now_iso():
 
 def parse_multipart(content_type, body):
     """multipart/form-data, as `curl -F` sends it: text fields headline, detail,
-    ref, thread and choice (repeated, or `choices` as a JSON list), and the
+    ref and choice (repeated, or `choices` as a JSON list), and the
     picture as the file field `image`. Returns (fields, image bytes or None)."""
     try:
         msg = BytesParser(policy=HTTP).parsebytes(
@@ -97,7 +95,7 @@ def parse_multipart(content_type, body):
                 choices.extend(json.loads(value))
             except (ValueError, TypeError):
                 raise HttpError(400, "choices must be a JSON list")
-        elif name in ("headline", "detail", "ref", "thread", "select", "other"):
+        elif name in ("headline", "detail", "ref", "select", "other"):
             fields[name] = value
     fields["choices"] = choices
     if image is not None and not image:
@@ -114,11 +112,11 @@ def parse_message(content_type, body):
     if content_type.startswith("multipart/form-data"):
         data, image = parse_multipart(content_type, body)
         headline, detail, choices = data.get("headline"), data.get("detail", ""), data["choices"]
-        ref, thread = data.get("ref") or None, data.get("thread") or None
+        ref = data.get("ref") or None
         other = data.get("other")
         if other is not None:
             other = other.strip().lower() in ("1", "true", "yes", "on")
-        return _message(headline, detail, choices, ref, thread, data.get("select") or None, other), image
+        return _message(headline, detail, choices, ref, data.get("select") or None, other), image
     try:
         raw = body.decode("utf-8")
     except UnicodeDecodeError:
@@ -134,15 +132,15 @@ def parse_message(content_type, body):
         headline = data.get("headline")
         detail = data.get("detail", "")
         choices = data.get("choices", [])
+        # A `thread` from before one conversation per agent is ignored: the sender is the conversation.
         ref = data.get("ref")
-        thread = data.get("thread")
         select, other = data.get("select"), data.get("other")
         if data.get("image") is not None:
             image = images.decode_base64(data["image"])
     else:
         headline, _, detail = raw.strip().partition("\n")
-        choices, ref, thread, select, other = [], None, None, None, None
-    return _message(headline, detail, choices, ref, thread, select, other), image
+        choices, ref, select, other = [], None, None, None
+    return _message(headline, detail, choices, ref, select, other), image
 
 
 def _options(choices):
@@ -173,7 +171,7 @@ def _options(choices):
     return options
 
 
-def _message(headline, detail, choices, ref, thread, select=None, other=None):
+def _message(headline, detail, choices, ref, select=None, other=None):
     if not isinstance(headline, str) or not headline.strip():
         raise HttpError(400, "headline is required")
     headline = headline.strip()
@@ -195,8 +193,6 @@ def _message(headline, detail, choices, ref, thread, select=None, other=None):
         raise HttpError(400, 'select "many" needs at least 2 choices')
     if ref is not None and (not isinstance(ref, str) or not REF_RE.match(ref)):
         raise HttpError(400, "ref must be 1-64 of [A-Za-z0-9_.:-]")
-    if thread is not None and (not isinstance(thread, str) or not THREAD_ID_RE.match(thread)):
-        raise HttpError(400, "thread must be a message id (m_…) or a reply's thread (t_…)")
 
     message = {
         "v": 1,
@@ -216,8 +212,6 @@ def _message(headline, detail, choices, ref, thread, select=None, other=None):
         message["other"] = True
     if ref:
         message["ref"] = ref
-    if thread:
-        message["thread"] = thread
     return message
 
 
@@ -277,14 +271,6 @@ class Outbox:
         with self.lock:
             rows = self.db.execute("SELECT seq, payload FROM messages ORDER BY seq").fetchall()
         return [(seq, json.loads(payload)) for seq, payload in rows]
-
-    def thread_of(self, message_id):
-        """The conversation `message_id` belongs to: the id of its first message.
-        An id the outbox doesn't know (pruned, or from before the outbox) starts
-        its own conversation."""
-        with self.lock:
-            row = self.db.execute("SELECT payload FROM messages WHERE id = ?", (message_id,)).fetchone()
-        return json.loads(row[0]).get("thread", message_id) if row else message_id
 
     def resign(self, key):
         """Sign everything kept under `key`. New keys on the phone (or a reinstall)
@@ -456,9 +442,6 @@ class RelayHandler(Handler):
                                 "width": width, "height": height, "sha256": digest}
             log.info("image %s for %s: %d bytes in, %dx%d %s of %d bytes kept", image_id, message["id"],
                      len(image), width, height, image_type, len(data))
-        if "thread" in message:
-            # The agent may name any message in the conversation; the phone groups by the first.
-            message["thread"] = self.outbox.thread_of(message["thread"])
         if agent:
             # Signed with the rest, so the phone can file it in that agent's channel.
             message["from"] = agent
@@ -467,8 +450,7 @@ class RelayHandler(Handler):
         self.outbox.add(message, body, agent)
         pushed = self.push(message, body) if self.push_endpoint else False
         log.info("stored %s (%s)", message["id"], "pushed" if pushed else "waiting to be fetched")
-        result = {"id": message["id"], "at": message["at"],
-                  "thread": message.get("thread", message["id"]), "pushed": pushed}
+        result = {"id": message["id"], "at": message["at"], "pushed": pushed}
         if "image" in message:
             result["image"] = dict(message["image"], path=f"/images/{message['image']['id']}")
         self.send_json(202, result)
@@ -532,7 +514,7 @@ class RelayHandler(Handler):
             if owners.message_owner(m["id"]) != name:
                 continue
             entry = {"direction": "out", "kind": "message", "seq": seq, "at": m["at"], "id": m["id"],
-                     "thread": m.get("thread", m["id"]), "headline": m.get("headline", ""),
+                     "headline": m.get("headline", ""),
                      "detail": m.get("detail", ""), "choices": m.get("choices", [])}
             if m.get("choices"):
                 entry["options"] = message_options(m)
@@ -546,12 +528,11 @@ class RelayHandler(Handler):
         for r in read_replies(self.inbox_db, 0, MAX_ROWS):
             if owners.owner(r) != name:
                 continue
-            thread = r["thread"] or (self.outbox.thread_of(r["messageId"]) if r["messageId"] else r["id"])
             for a in r["attachments"]:
                 a["path"] = f"/attachments/{a['id']}"
             entries.append({"direction": "in", "kind": "reply", "seq": r["seq"], "at": r["receivedAt"],
-                            "id": r["id"], "messageId": r["messageId"], "thread": thread, "to": r["to"],
-                            "title": r["title"], "choice": r["choice"], "text": r["text"],
+                            "id": r["id"], "messageId": r["messageId"], "to": r["to"],
+                            "choice": r["choice"], "text": r["text"],
                             "choiceIds": r["choiceIds"], "other": r["other"], "answeredAt": r["answeredAt"],
                             "secondAnswer": r["secondAnswer"],
                             "attachments": r["attachments"], "sentAt": r["sentAt"], "receivedAt": r["receivedAt"]})
@@ -559,9 +540,7 @@ class RelayHandler(Handler):
         # Times are to the second; within one, the agent's messages come first (a reply
         # can't come before the message it answers), then each side in its own order.
         entries.sort(key=lambda e: (e["at"], e["direction"] == "in", e["seq"]))
-        latest = entries[-1] if entries else None
-        self.send_json(200, {"agent": name, "total": len(entries), "entries": entries[-limit:],
-                             "thread": latest["thread"] if latest else None})
+        self.send_json(200, {"agent": name, "total": len(entries), "entries": entries[-limit:]})
 
     def attachment(self, attachment_id):
         if not ATTACHMENT_ID_RE.match(attachment_id):

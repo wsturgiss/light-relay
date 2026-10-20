@@ -10,7 +10,6 @@ relay's ALLOWED_PEERS). It holds no secrets: the relay knows it by its device.
     relayctl.py notify "Book the 9:40?" "Holds expire at noon." --choice Yes --choice No
     relayctl.py notify "Clean up?" --choice keep=Keep --danger del="Delete all" --other   # danger asks to confirm
     relayctl.py notify "Groceries?" --choice Milk --choice Eggs --choice Bread --many    # pick several, then Done
-    relayctl.py notify "Booked." "Seat 14C." --thread m_5eea46d64d2ed130   # continue that conversation
     relayctl.py replies            # new replies, as JSON; does not mark them read
     relayctl.py replies --ack      # print them, then mark them read
     relayctl.py ack 17             # mark everything up to seq 17 read
@@ -81,8 +80,8 @@ def main():
     n.add_argument("--many", action="store_true", help="the user can pick several choices, then Done")
     n.add_argument("--other", action="store_true", help="also offer Other: a typed answer")
     n.add_argument("--ref", help="your own id for this message, echoed back in the push")
-    n.add_argument("--thread", help="continue the conversation this message id is part of "
-                                    "(e.g. the messageId of the reply you're answering)")
+    # One conversation per agent: --thread is accepted, so old callers still work, and ignored.
+    n.add_argument("--thread", help=argparse.SUPPRESS)
 
     r = sub.add_parser("replies", help="replies not yet acknowledged")
     r.add_argument("--ack", action="store_true",
@@ -106,8 +105,6 @@ def main():
             payload["other"] = True
         if args.ref:
             payload["ref"] = args.ref
-        if args.thread:
-            payload["thread"] = args.thread
         print(json.dumps(call("POST", "/notify", payload)))
     elif args.cmd == "replies":
         result = call("GET", f"/replies?limit={args.limit}")

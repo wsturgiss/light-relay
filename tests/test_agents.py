@@ -84,28 +84,45 @@ class Agents(unittest.TestCase):
     def test_each_agent_reads_only_its_own(self):
         # Jarvis sends a message; the phone answers it.
         m = self.as_agent("/notify", "POST", {"headline": "Groceries?"}, token=JARVIS)[1]["id"]
-        self.reply({"id": "r_jarvis", "messageId": m, "text": "Milk"})
-        # A conversation started on the phone for Marcus Aurelius, and its follow-up.
-        t = "t_00000000000000aa"
-        self.reply({"id": "r_marcus", "thread": t, "title": "Stoicism", "text": "Hi", "to": "marcus aurelius"})
-        self.reply({"id": "r_marcus2", "thread": t, "text": "More", "to": "Marcus Aurelius"})
-        # Marcus answers in that conversation; the phone replies to the answer.
-        answer = self.as_agent("/notify", "POST", {"headline": "Hello", "thread": t}, token=MARCUS)[1]["id"]
-        self.reply({"id": "r_marcus3", "messageId": answer, "thread": t, "text": "Thanks"})
-        # Answers to messages from before senders were recorded, and phone starts
-        # without a recipient, are the default agent's (Huginn, first in AGENTS).
+        self.reply({"id": "r_jarvis", "messageId": m, "choice": "Yes", "to": "Jarvis"})
+        # Written in Marcus Aurelius's conversation on the phone.
+        self.reply({"id": "r_marcus", "text": "Hi", "to": "marcus aurelius"})
+        self.reply({"id": "r_marcus2", "text": "More", "to": "Marcus Aurelius"})
+        # From a phone that predates `to` on every reply: whoever sent the message it
+        # answers, else (a message from before senders were recorded) the default agent.
+        self.reply({"id": "r_legacy", "messageId": m, "text": "Milk"})
         self.reply({"id": "r_old", "messageId": "m_00000000000000ff", "choice": "Yes"})
-        self.reply({"id": "r_nobody", "thread": "t_00000000000000bb", "text": "Hey"})
+        self.reply({"id": "r_nobody", "text": "Hey"})
 
-        self.assertEqual(self.mine(JARVIS), ["r_jarvis"])
-        self.assertEqual(self.mine(MARCUS), ["r_marcus", "r_marcus2", "r_marcus3"])
+        self.assertEqual(self.mine(JARVIS), ["r_jarvis", "r_legacy"])
+        self.assertEqual(self.mine(MARCUS), ["r_marcus", "r_marcus2"])
         self.assertEqual(self.mine(), ["r_old", "r_nobody"])           # Huginn, by IP
         self.assertEqual(self.as_agent("/replies", token=JARVIS)[1]["agent"], "Jarvis")
 
+    def test_written_in_an_agents_conversation_it_goes_to_that_agent(self):
+        # Oct 20: typed in Huginn's conversation while the newest message there was
+        # Jarvis's. Who the reply names wins over whose message it carries.
+        m = self.as_agent("/notify", "POST", {"headline": "One channel per bot"}, token=JARVIS)[1]["id"]
+        self.reply({"id": "r_hello", "messageId": m, "text": "Helloooo", "to": "Huginn"})
+        self.reply({"id": "r_choice", "messageId": m, "choice": "Yes", "to": "huginn"})
+        self.assertEqual(self.mine(JARVIS), [])
+        self.assertEqual(self.mine(), ["r_hello", "r_choice"])
+        self.assertEqual([e["id"] for e in self.channel()["entries"] if e["direction"] == "in"], ["r_hello", "r_choice"])
+
+    def test_a_legacy_thread_is_ignored(self):
+        # Callers from before one conversation per agent still name threads: accepted, not used.
+        status, body = self.as_agent("/notify", "POST", {"headline": "Hi", "thread": "m_00000000000000ff"}, token=JARVIS)
+        self.assertEqual((status, "thread" in body), (202, False))
+        self.assertEqual(self.as_agent("/notify", "POST", {"headline": "Hi", "thread": "not-an-id"}, token=JARVIS)[0], 202)
+        self.assertNotIn("thread", json.loads(e2e.FakePush.received[-1].decode().split(".", 2)[2]))
+        self.reply({"id": "r1", "thread": "t_00000000000000aa", "title": "Old start", "text": "B", "to": "Marcus Aurelius"})
+        got = self.as_agent("/replies", token=MARCUS)[1]["replies"]
+        self.assertEqual([(r["id"], "thread" in r, "title" in r) for r in got], [("r1", False, False)])
+
     def test_each_agent_acknowledges_for_itself(self):
         m = self.as_agent("/notify", "POST", {"headline": "Q"}, token=JARVIS)[1]["id"]
-        self.reply({"id": "r1", "messageId": m, "text": "A"})
-        self.reply({"id": "r2", "thread": "t_00000000000000aa", "text": "B", "to": "Huginn"})
+        self.reply({"id": "r1", "messageId": m, "text": "A", "to": "Jarvis"})
+        self.reply({"id": "r2", "text": "B", "to": "Huginn"})
         self.assertEqual(self.as_agent("/replies/ack", "POST", {"upTo": 1}, token=JARVIS)[1], {"cursor": 1})
         self.assertEqual(self.mine(JARVIS), [])
         self.assertEqual(self.mine(), ["r2"])
@@ -136,32 +153,30 @@ class Agents(unittest.TestCase):
 
     def test_a_channel_is_everything_between_the_phone_and_one_agent(self):
         q = self.as_agent("/notify", "POST", {"headline": "Groceries?", "choices": ["Yes", "No"]}, token=JARVIS)[1]["id"]
-        self.reply({"id": "r_choice", "messageId": q, "choice": "Yes"})
+        self.reply({"id": "r_choice", "messageId": q, "choice": "Yes", "to": "Jarvis"})
         self.as_agent("/notify", "POST", {"headline": "Huginn here"})                           # someone else's
-        self.reply({"id": "r_other", "thread": "t_00000000000000bb", "text": "Hey"})             # Huginn's
-        t = "t_00000000000000aa"
+        self.reply({"id": "r_other", "text": "Hey"})                                             # Huginn's
         e2e.EndToEnd.upload(self, "a_0000000000000001", e2e.VOICE)
         inbox.InboxHandler.store.add_transcript("a_0000000000000001", "Pick up milk.")
-        self.reply({"id": "r_voice", "thread": t, "title": "Errands", "to": "jarvis", "text": "",
-                    "attachments": ["a_0000000000000001"]})
+        self.reply({"id": "r_voice", "to": "jarvis", "text": "", "attachments": ["a_0000000000000001"]})
         time.sleep(1.1)       # times are to the second; within one, the agent's messages come first
-        a = self.as_agent("/notify", "POST", {"headline": "On it", "thread": t}, token=JARVIS)[1]["id"]
+        a = self.as_agent("/notify", "POST", {"headline": "On it"}, token=JARVIS)[1]["id"]
 
         got = self.channel(JARVIS)
         self.assertEqual(got["agent"], "Jarvis")
         self.assertEqual([(e["direction"], e["id"]) for e in got["entries"]],
                          [("out", q), ("in", "r_choice"), ("in", "r_voice"), ("out", a)])
-        self.assertEqual([e["thread"] for e in got["entries"]], [q, q, t, t])
-        self.assertEqual(got["thread"], t)                       # where the next message continues
+        self.assertFalse(any("thread" in e or "title" in e for e in got["entries"]))
+        self.assertNotIn("thread", got)
         self.assertEqual(got["entries"][0]["choices"], ["Yes", "No"])
         self.assertEqual(got["entries"][1]["messageId"], q)
         voice = got["entries"][2]["attachments"][0]
         self.assertEqual((voice["transcript"], voice["path"]), ("Pick up milk.", "/attachments/a_0000000000000001"))
         times = [e["at"] for e in got["entries"]]
         self.assertEqual(times, sorted(times))
-        # Huginn's channel, by IP: its message, and the phone start nobody was named for.
+        # Huginn's channel, by IP: its message, and the reply that names no one.
         self.assertEqual([e["id"] for e in self.channel()["entries"]][1:], ["r_other"])
-        self.assertEqual(self.channel(MARCUS), {"agent": "Marcus Aurelius", "total": 0, "entries": [], "thread": None})
+        self.assertEqual(self.channel(MARCUS), {"agent": "Marcus Aurelius", "total": 0, "entries": []})
 
     def test_a_channel_limit_keeps_the_newest_still_oldest_first(self):
         ids = [self.as_agent("/notify", "POST", {"headline": f"n{i}"}, token=JARVIS)[1]["id"] for i in range(4)]
@@ -188,9 +203,9 @@ class Agents(unittest.TestCase):
     def test_a_reply_wakes_only_its_agents_webhook(self):
         m = self.as_agent("/notify", "POST", {"headline": "Q"}, token=JARVIS)[1]["id"]
         self.reply({"id": "r1", "messageId": m, "text": "A"})
-        self.reply({"id": "r2", "thread": "t_00000000000000aa", "text": "B", "to": "Huginn"})
+        self.reply({"id": "r2", "text": "B", "to": "Huginn"})
         # Marcus Aurelius has no webhook: nobody is woken for this one.
-        self.reply({"id": "r3", "thread": "t_00000000000000cc", "text": "C", "to": "Marcus Aurelius"})
+        self.reply({"id": "r3", "text": "C", "to": "Marcus Aurelius"})
         got = sorted(self.hooks_after(2))
         self.assertEqual(got, [("/huginn", "Bearer hk", {"newest_seq": 2, "to": "Huginn"}),
                                ("/jarvis", "Bearer jk", {"newest_seq": 1, "to": "Jarvis"})])

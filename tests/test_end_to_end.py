@@ -5,20 +5,25 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-from lightrelay import inbox, relay
+from lightrelay import inbox, relay, transcribe
 from lightrelay.common import RateLimiter, serve
 
 AGENT_IP = "100.64.0.7"
+OTHER_AGENT_IP = "100.64.0.8"
 STRANGER_IP = "100.64.0.99"
 PUSH_KEY = b"k" * 43
 REPLY_TOKEN = "t" * 43
+VOICE = b"OggS\x00\x02" + b"\x00" * 200
+PHOTO = b"\xff\xd8\xff\xe0" + b"\x01" * 300
 
 
 class FakePush(BaseHTTPRequestHandler):
@@ -30,6 +35,27 @@ class FakePush(BaseHTTPRequestHandler):
         self.send_response(self.status)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class FakeTranscriber(BaseHTTPRequestHandler):
+    """An OpenAI-style /audio/transcriptions endpoint."""
+    received = []
+    status = 200
+    text = "Pick up milk on the way home."
+    error = {"error": {"code": "invalid_api_key"}}
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.received.append((self.headers["Authorization"], body))
+        payload = json.dumps({"text": self.text} if self.status == 200 else self.error).encode()
+        self.send_response(self.status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def log_message(self, *args):
         pass
@@ -77,12 +103,13 @@ class EndToEnd(unittest.TestCase):
         inbox.InboxHandler.trusted_proxies = loopback
         self.inbox, self.inbox_url = start(inbox.InboxHandler)
 
-        relay.RelayHandler.allowed_peers = frozenset({ipaddress.ip_address(AGENT_IP)})
+        relay.RelayHandler.allowed_peers = frozenset(map(ipaddress.ip_address, (AGENT_IP, OTHER_AGENT_IP)))
         relay.RelayHandler.push_endpoint = push_url + "/push/abc"
         relay.RelayHandler.push_key = PUSH_KEY
         relay.RelayHandler.notify_limit = RateLimiter(100, 3600)
         relay.RelayHandler.outbox = relay.Outbox(outbox_db)
         relay.RelayHandler.inbox_db = f"{self.tmp.name}/inbox.db"
+        relay.RelayHandler.attachments_dir = inbox.InboxHandler.store.attachments_dir
         relay.RelayHandler.cursor = relay.Cursor(f"{self.tmp.name}/cursor.json")
         relay.RelayHandler.trusted_proxies = loopback
         self.relay, self.relay_url = start(relay.RelayHandler)
@@ -101,6 +128,21 @@ class EndToEnd(unittest.TestCase):
 
     def fetch(self, path, token=REPLY_TOKEN, via="203.0.113.5"):
         return request(self.inbox_url + path, headers={"Authorization": f"Bearer {token}"}, via=via)
+
+    def upload(self, attachment_id, data, content_type="audio/ogg", token=REPLY_TOKEN):
+        return request(self.inbox_url + f"/attachments/{attachment_id}", "PUT", data,
+                       {"Authorization": f"Bearer {token}", "Content-Type": content_type},
+                       via="203.0.113.5")
+
+    def download(self, attachment_id, via=AGENT_IP):
+        req = urllib.request.Request(self.relay_url + f"/attachments/{attachment_id}",
+                                     headers={"X-Forwarded-For": via})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, resp.headers.get_content_type(), resp.read()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, None, e.read()
 
     def notify(self, headline):
         status, body = request(self.relay_url + "/notify", "POST", {"headline": headline}, via=AGENT_IP)
@@ -181,24 +223,14 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(json.loads(payload)["headline"], "before new keys")
         self.assertEqual(relay.RelayHandler.outbox.resign(new_key), 0)
 
-    def test_a_follow_up_joins_the_first_messages_thread(self):
+    def test_a_thread_from_an_older_agent_is_accepted_and_ignored(self):
         first = self.notify("Tailnet test")
-        self.assertEqual(first["thread"], first["id"])
-        second = request(self.relay_url + "/notify", "POST",
-                         {"headline": "Got your Got it", "thread": first["id"]}, via=AGENT_IP)[1]
-        # Naming the second message still lands in the first one's thread.
-        third = request(self.relay_url + "/notify", "POST",
-                        {"headline": "And again", "thread": second["id"]}, via=AGENT_IP)[1]
-        self.assertEqual((second["thread"], third["thread"]), (first["id"], first["id"]))
+        for thread in (first["id"], "m_00000000000000ff", "not-an-id"):
+            status, body = request(self.relay_url + "/notify", "POST",
+                                   {"headline": "Got your Got it", "thread": thread}, via=AGENT_IP)
+            self.assertEqual((status, "thread" in body), (202, False))
         pushed = [json.loads(b.decode().split(".", 2)[2]) for b in FakePush.received]
-        self.assertEqual([m.get("thread") for m in pushed], [None, first["id"], first["id"]])
-
-    def test_unknown_thread_starts_its_own(self):
-        status, body = request(self.relay_url + "/notify", "POST",
-                               {"headline": "hi", "thread": "m_00000000000000ff"}, via=AGENT_IP)
-        self.assertEqual((status, body["thread"]), (202, "m_00000000000000ff"))
-        self.assertEqual(request(self.relay_url + "/notify", "POST",
-                                 {"headline": "hi", "thread": "not-an-id"}, via=AGENT_IP)[0], 400)
+        self.assertEqual([m.get("thread") for m in pushed], [None] * 4)
 
     def test_unpaired_relay_answers_503(self):
         relay.RelayHandler.push_key = None
@@ -242,24 +274,65 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(request(self.relay_url + "/replies/ack", "POST", {"upTo": last}, via=AGENT_IP)[0], 200)
         self.assertEqual(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"], [])
 
-    def test_conversation_started_on_the_phone_reaches_the_agent_and_back(self):
+    def test_each_agent_acknowledges_only_for_itself(self):
+        self.reply({"id": "r1", "messageId": "m_1", "choice": "Yes"})
+        self.reply({"id": "r2", "messageId": "m_2", "choice": "No"})
+        ack = lambda seq, via: request(self.relay_url + "/replies/ack", "POST", {"upTo": seq}, via=via)[1]
+        ids = lambda via: [r["id"] for r in request(self.relay_url + "/replies", via=via)[1]["replies"]]
+        self.assertEqual(ack(2, AGENT_IP), {"cursor": 2})
+        self.assertEqual(ids(AGENT_IP), [])
+        # The other agent still has both, and its own position.
+        self.assertEqual(ids(OTHER_AGENT_IP), ["r1", "r2"])
+        self.assertEqual(ack(1, OTHER_AGENT_IP), {"cursor": 1})
+        self.assertEqual(ids(OTHER_AGENT_IP), ["r2"])
+        self.assertEqual(ids(AGENT_IP), [])
+
+    def test_agents_start_from_the_shared_position(self):
+        # A cursor file from before agents had their own.
+        with open(relay.RelayHandler.cursor.path, "w") as f:
+            json.dump({"seq": 1}, f)
+        self.reply({"id": "r1", "messageId": "m_1", "choice": "Yes"})
+        self.reply({"id": "r2", "messageId": "m_2", "choice": "No"})
+        for via in (AGENT_IP, OTHER_AGENT_IP):
+            self.assertEqual([r["id"] for r in request(self.relay_url + "/replies", via=via)[1]["replies"]], ["r2"])
+
+    def test_a_phone_start_from_an_older_phone_still_arrives(self):
         start = {"id": "r_start", "thread": "t_0123456789abcdef", "title": "Plan Saturday",
                  "text": "Plan Saturday\nHike or the market?"}
         self.assertEqual(self.reply(start)[0], 202)
         got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
-        self.assertEqual((got["thread"], got["title"], got["messageId"]),
-                         ("t_0123456789abcdef", "Plan Saturday", None))
-        answer = request(self.relay_url + "/notify", "POST",
-                         {"headline": "Hike", "thread": got["thread"]}, via=AGENT_IP)[1]
-        self.assertEqual(answer["thread"], "t_0123456789abcdef")
-        # The phone can read its own start back to rebuild the conversation.
-        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["title"], "Plan Saturday")
+        self.assertEqual((got["text"], got["messageId"], "thread" in got, "title" in got),
+                         ("Plan Saturday\nHike or the market?", None, False, False))
 
-    def test_bad_thread_or_title_is_rejected(self):
-        for body in ({"id": "r1", "text": "x", "thread": "m_0123456789abcdef"},
-                     {"id": "r1", "text": "x", "title": "no thread"},
-                     {"id": "r1", "text": "x", "thread": "t_0123456789abcdef", "title": "x" * 121}):
-            self.assertEqual(self.reply(body)[0], 400, body)
+    def test_a_reply_names_its_agent(self):
+        inbox.InboxHandler.agents = ("Huginn", "Claude")
+        self.addCleanup(setattr, inbox.InboxHandler, "agents", ())
+        self.assertEqual(self.fetch("/agents")[1], {"agents": ["Huginn", "Claude"]})
+        self.assertEqual(self.reply({"id": "r1", "text": "Plan Saturday", "to": "claude"})[0], 202)
+        # A choice names its agent too, and still says which question it answers.
+        self.assertEqual(self.reply({"id": "r2", "messageId": "m_1", "choice": "Yes", "to": "Claude"})[0], 202)
+        # Spelled as configured, for the agent and for the phone's history.
+        self.assertEqual([r["to"] for r in request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"]],
+                         ["Claude", "Claude"])
+        self.assertEqual(self.fetch("/replies")[1]["replies"][1]["messageId"], "m_1")
+        self.assertEqual(self.reply({"id": "r3", "text": "x", "to": "<b>"})[0], 400)
+
+    def test_replies_without_a_recipient_say_so(self):
+        self.reply({"id": "r1", "messageId": "m_1", "choice": "Yes"})
+        self.assertIsNone(request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]["to"])
+        self.assertEqual(self.fetch("/agents")[1], {"agents": []})
+
+    def test_agents_setting(self):
+        self.assertEqual(inbox.parse_agents(" Huginn, Claude "), ["Huginn", "Claude"])
+        self.assertEqual(inbox.parse_agents(None), [])
+        for bad in ("Huginn,huginn", "a/b", "x" * 25):
+            with self.assertRaises(SystemExit):
+                inbox.parse_agents(bad)
+
+    def test_a_legacy_thread_or_title_is_ignored(self):
+        for n, body in enumerate(({"text": "x", "thread": "m_0123456789abcdef"}, {"text": "x", "title": "no thread"},
+                                  {"text": "x", "thread": "t_0123456789abcdef", "title": "x" * 121})):
+            self.assertEqual(self.reply({"id": f"r{n}", **body})[0], 202, body)
 
     def test_older_reply_database_gains_the_new_columns(self):
         path = f"{self.tmp.name}/old.db"
@@ -272,7 +345,8 @@ class EndToEnd(unittest.TestCase):
         old.close()
         store = inbox.ReplyStore(path)
         try:
-            self.assertEqual(store.since(0, 10)[0]["thread"], None)
+            self.assertEqual((store.since(0, 10)[0]["to"], store.since(0, 10)[0]["attachments"]),
+                             (None, []))
         finally:
             store.db.close()
 
@@ -299,9 +373,11 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.reply({"id": "r1", "text": "x"}, token="nope")[0], 401)
 
     def test_inbox_offers_nothing_else(self):
+        inbox.InboxHandler.per_ip = RateLimiter(100, 60)
         self.reply({"id": "r1", "text": "hello"})
         for method, path in (("GET", "/"), ("DELETE", "/replies"), ("POST", "/notify"),
-                             ("POST", "/messages"), ("GET", "/healthz")):
+                             ("POST", "/messages"), ("GET", "/healthz"),
+                             ("GET", "/attachments/a_0000000000000001")):
             status, _ = request(self.inbox_url + path, method,
                                 headers={"Authorization": f"Bearer {REPLY_TOKEN}"})
             self.assertEqual(status, 404, (method, path))
@@ -319,6 +395,178 @@ class EndToEnd(unittest.TestCase):
 
     def test_empty_reply_is_rejected(self):
         self.assertEqual(self.reply({"id": "r1", "text": "  "})[0], 400)
+
+    # attachments: voice notes and photos, phone -> agent
+
+    def test_voice_note_reaches_the_agent(self):
+        self.assertEqual(self.upload("a_0000000000000001", VOICE)[0], 201)
+        self.assertEqual(self.reply({"id": "r1", "messageId": "m_1",
+                                     "attachments": ["a_0000000000000001"]})[0], 202)
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
+        self.assertEqual((got["text"], got["choice"]), (None, None))
+        self.assertEqual(got["attachments"],
+                         [{"id": "a_0000000000000001", "type": "audio/ogg", "bytes": len(VOICE)}])
+        self.assertEqual(self.download("a_0000000000000001"), (200, "audio/ogg", VOICE))
+        # The tool sees the same thing when it rebuilds its history.
+        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["attachments"], got["attachments"])
+
+    def test_photo_with_text(self):
+        inbox.InboxHandler.per_ip = RateLimiter(100, 60)
+        self.upload("a_00000000000000a1", PHOTO, "image/jpeg")
+        self.upload("a_00000000000000a2", b"\x89PNG\r\n\x1a\n" + b"\x00" * 50, "image/png")
+        self.reply({"id": "r1", "text": "Which of these?",
+                    "attachments": ["a_00000000000000a1", "a_00000000000000a2"]})
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
+        self.assertEqual([a["type"] for a in got["attachments"]], ["image/jpeg", "image/png"])
+        self.assertEqual(self.download("a_00000000000000a1")[2], PHOTO)
+
+    def test_upload_must_be_what_it_says(self):
+        inbox.InboxHandler.per_ip = RateLimiter(100, 60)
+        self.assertEqual(self.upload("a_0000000000000001", PHOTO, "audio/ogg")[0], 400)
+        self.assertEqual(self.upload("a_0000000000000001", b"", "audio/ogg")[0], 400)
+        self.assertEqual(self.upload("a_0000000000000001", VOICE, "application/pdf")[0], 415)
+        self.assertEqual(self.upload("a_not_hex", VOICE)[0], 400)
+        self.assertEqual(self.upload("../../etc/passwd", VOICE)[0], 404)
+        self.assertEqual(self.upload("a_0000000000000001", VOICE, token="nope")[0], 401)
+        # Nothing was kept from any of those.
+        self.assertEqual(self.reply({"id": "r1", "attachments": ["a_0000000000000001"]})[0], 400)
+        self.assertEqual(os.listdir(inbox.InboxHandler.store.attachments_dir), [])
+
+    def test_upload_retries_are_stored_once(self):
+        self.assertEqual(self.upload("a_0000000000000001", VOICE)[0], 201)
+        self.assertEqual(self.upload("a_0000000000000001", VOICE)[0], 200)
+        self.assertEqual(self.upload("a_0000000000000001", VOICE + b"x")[0], 409)
+        self.assertEqual(self.download("a_0000000000000001")[2], VOICE)
+
+    def test_reply_needs_its_attachments_uploaded_first(self):
+        self.assertEqual(self.reply({"id": "r1", "attachments": ["a_00000000000000ff"]})[0], 400)
+        for bad in (["nope"], ["a_0000000000000001"] * 2, "a_0000000000000001"):
+            self.assertEqual(self.reply({"id": "r1", "text": "x", "attachments": bad})[0], 400, bad)
+
+    def test_upload_size_is_capped(self):
+        inbox.InboxHandler.max_attachment = 100
+        try:
+            self.assertEqual(self.upload("a_0000000000000001", VOICE)[0], 413)
+        finally:
+            inbox.InboxHandler.max_attachment = 10 << 20
+
+    def test_oldest_attachments_go_past_the_total(self):
+        inbox.InboxHandler.per_ip = RateLimiter(100, 60)
+        inbox.InboxHandler.store.attachment_total = len(VOICE) * 2
+        for i in range(3):
+            self.upload(f"a_000000000000000{i}", VOICE)
+        self.assertEqual(self.download("a_0000000000000000")[0], 404)
+        self.assertEqual(self.download("a_0000000000000002")[0], 200)
+        self.assertEqual(len(os.listdir(inbox.InboxHandler.store.attachments_dir)), 2)
+
+    def test_expired_attachment_is_gone(self):
+        self.upload("a_0000000000000001", VOICE)
+        store = inbox.InboxHandler.store
+        store.db.execute("UPDATE attachments SET received_at = '2000-01-01T00:00:00Z'")
+        store.attachment_days = 30
+        self.upload("a_0000000000000002", VOICE)
+        self.assertEqual(self.download("a_0000000000000001")[0], 404)
+
+    def test_stranger_cannot_download(self):
+        self.upload("a_0000000000000001", VOICE)
+        self.assertEqual(self.download("a_0000000000000001", via=STRANGER_IP)[0], 403)
+        self.assertEqual(self.download("a_bad")[0], 400)
+
+
+    # transcripts: voice notes to text, through the transcription service
+
+    def transcribing(self, status=200):
+        FakeTranscriber.received, FakeTranscriber.status = [], status
+        inbox.InboxHandler.per_ip = RateLimiter(1000, 60)  # wait_for polls
+        server, url = start(FakeTranscriber)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        worker = transcribe.Transcriber(inbox.InboxHandler.store, "sk-test", url + "/v1/audio/transcriptions",
+                                        retry_delay=0).start()
+        inbox.InboxHandler.transcriber = worker
+        self.addCleanup(setattr, inbox.InboxHandler, "transcriber", None)
+        self.addCleanup(worker.stop)
+        return worker
+
+    def wait_for(self, check):
+        for _ in range(100):
+            if check():
+                return
+            time.sleep(0.02)
+        self.fail("timed out")
+
+    def test_voice_note_is_transcribed_for_the_phone_and_the_agent(self):
+        self.transcribing()
+        self.upload("a_0000000000000001", VOICE)
+        self.reply({"id": "r1", "messageId": "m_1", "attachments": ["a_0000000000000001"]})
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        self.assertEqual(self.fetch("/transcripts")[1]["transcripts"],
+                         [{"seq": 1, "id": "a_0000000000000001", "text": "Pick up milk on the way home."}])
+        self.assertEqual(self.fetch("/transcripts?after=1")[1]["transcripts"], [])
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]
+        self.assertEqual(got["attachments"][0]["transcript"], "Pick up milk on the way home.")
+        self.assertEqual(self.fetch("/replies")[1]["replies"][0]["attachments"], got["attachments"])
+        # What went to the service: the key, the model and the file, named so it knows the format.
+        auth, body = FakeTranscriber.received[0]
+        self.assertEqual(auth, "Bearer sk-test")
+        self.assertIn(b'name="model"\r\n\r\ngpt-4o-mini-transcribe', body)
+        self.assertIn(b'filename="a_0000000000000001.ogg"', body)
+        self.assertIn(VOICE, body)
+
+    def test_photos_and_retries_are_not_transcribed(self):
+        self.transcribing()
+        self.upload("a_00000000000000a1", PHOTO, "image/jpeg")
+        self.upload("a_0000000000000001", VOICE)
+        self.upload("a_0000000000000001", VOICE)
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        time.sleep(0.1)
+        self.assertEqual(len(FakeTranscriber.received), 1)
+
+    def test_refused_transcription_says_why(self):
+        self.transcribing(status=401)
+        self.upload("a_0000000000000001", VOICE)
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        self.assertEqual(len(FakeTranscriber.received), 1)  # not retried
+        self.assertEqual(self.fetch("/transcripts")[1]["transcripts"],
+                         [{"seq": 1, "id": "a_0000000000000001", "text": "", "error": "Transcription key refused"}])
+        self.reply({"id": "r1", "attachments": ["a_0000000000000001"]})
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"][0]["attachments"][0]
+        self.assertNotIn("transcript", got)
+        self.assertEqual(got["transcriptError"], "Transcription key refused")
+
+    def test_out_of_credit_is_not_retried_but_comes_back_after_a_restart(self):
+        FakeTranscriber.error = {"error": {"code": "insufficient_quota", "message": "You have no credits remaining."}}
+        self.addCleanup(setattr, FakeTranscriber, "error", {"error": {"code": "invalid_api_key"}})
+        worker = self.transcribing(status=429)
+        self.upload("a_0000000000000001", VOICE)
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        self.assertEqual(len(FakeTranscriber.received), 1)
+        self.assertEqual(self.fetch("/transcripts")[1]["transcripts"][0]["error"], "No transcription credit left")
+        # Credit added, inbox restarted: the note is tried again, and the text follows the error.
+        worker.stop()
+        self.transcribing()
+        self.wait_for(lambda: self.fetch("/transcripts?after=1")[1]["transcripts"])
+        self.assertEqual(self.fetch("/transcripts?after=1")[1]["transcripts"],
+                         [{"seq": 2, "id": "a_0000000000000001", "text": "Pick up milk on the way home."}])
+
+    def test_service_errors_are_retried(self):
+        self.transcribing(status=503)
+        self.upload("a_0000000000000001", VOICE)
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+        self.assertEqual(len(FakeTranscriber.received), transcribe.ATTEMPTS)
+        self.assertEqual(self.fetch("/transcripts")[1]["transcripts"][0]["error"], "Transcription service unavailable")
+
+    def test_notes_missed_while_down_are_transcribed_at_start(self):
+        self.upload("a_0000000000000001", VOICE)
+        self.transcribing()
+        self.wait_for(lambda: self.fetch("/transcripts")[1]["transcripts"])
+
+    def test_relay_reads_an_inbox_without_transcripts(self):
+        self.upload("a_0000000000000001", VOICE)
+        self.reply({"id": "r1", "attachments": ["a_0000000000000001"]})
+        inbox.InboxHandler.store.db.execute("DROP TABLE transcripts")
+        got = request(self.relay_url + "/replies", via=AGENT_IP)[1]["replies"]
+        self.assertEqual(len(got), 1)
 
 
 if __name__ == "__main__":

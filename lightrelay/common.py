@@ -4,6 +4,8 @@ import ipaddress
 import json
 import logging
 import os
+import re
+import shutil
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,12 +13,46 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 log = logging.getLogger("lightrelay")
 
 # A reply as both the agent (via the relay) and the tool (via the inbox) read it.
-REPLY_COLUMNS = "seq, id, message_id, thread, title, choice, text, sent_at, received_at"
+REPLY_COLUMNS = ("seq, id, message_id, thread, title, choice, text, sent_at, received_at, attachments, to_agent,"
+                 " choice_ids, other, answered_at, second_answer")
+
+
+def message_options(message):
+    """A message's choices as [{id, label, style}]: its `options`, or its labels as c1, c2, ..."""
+    return message.get("options") or [{"id": f"c{n}", "label": label, "style": "default"}
+                                      for n, label in enumerate(message.get("choices", []), 1)]
+
+# A file the phone sent with a reply: a voice note or a photo. The phone names it.
+ATTACHMENT_ID_RE = re.compile(r"^a_[0-9a-f]{16}$")
+ATTACHMENT_COLUMNS = "id, type, bytes, sha256, received_at"
+
+
+def with_transcripts(replies, transcripts):
+    """Puts each voice note's transcript, or why it has none, on the reply's
+    attachment. `transcripts` maps attachment ids to (text, error)."""
+    for reply in replies:
+        for attachment in reply["attachments"]:
+            text, error = transcripts.get(attachment["id"], (None, None))
+            if error:
+                attachment["transcriptError"] = error
+            elif text is not None:
+                attachment["transcript"] = text
+    return replies
+
+
+def attachment_ids(replies):
+    return sorted({a["id"] for r in replies for a in r["attachments"]})
 
 
 def reply_from_row(r):
-    return {"seq": r[0], "id": r[1], "messageId": r[2], "thread": r[3], "title": r[4],
-            "choice": r[5], "text": r[6], "sentAt": r[7], "receivedAt": r[8]}
+    # r[3], r[4]: thread and title, kept on rows from before one conversation per agent.
+    return {"seq": r[0], "id": r[1], "messageId": r[2],
+            "choice": r[5], "text": r[6], "sentAt": r[7], "receivedAt": r[8],
+            "attachments": json.loads(r[9]) if r[9] else [], "to": r[10],
+            # Answering a question: the ids tapped, whether it's the free-text "Other",
+            # when the question was first answered, and whether this came after that.
+            "choiceIds": json.loads(r[11]) if r[11] else None, "other": bool(r[12]),
+            "answeredAt": r[13], "secondAnswer": bool(r[14])}
 
 
 def env(name, default=None, required=False):
@@ -113,14 +149,35 @@ class Handler(BaseHTTPRequestHandler):
                     pass
         return peer
 
-    def read_body(self):
+    def read_body(self, limit=None):
+        limit = limit or self.max_body
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             raise HttpError(411, "Content-Length required")
-        if length < 0 or length > self.max_body:
-            raise HttpError(413, f"body over {self.max_body} bytes")
-        return self.rfile.read(length)
+        if length < 0 or length > limit:
+            raise HttpError(413, f"body over {limit} bytes")
+        data = self.rfile.read(length)
+        if len(data) != length:
+            raise HttpError(400, "body ended early")
+        return data
+
+    def read_body_to(self, f, limit):
+        """Copy the body into `f` without holding it in memory. Returns its length."""
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            raise HttpError(411, "Content-Length required")
+        if length < 0 or length > limit:
+            raise HttpError(413, f"body over {limit} bytes")
+        left = length
+        while left:
+            chunk = self.rfile.read(min(left, 65536))
+            if not chunk:
+                raise HttpError(400, "body ended early")
+            f.write(chunk)
+            left -= len(chunk)
+        return length
 
     def read_json(self):
         try:
@@ -139,6 +196,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def send_file(self, path, content_type, length):
+        with open(path, "rb") as f:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            shutil.copyfileobj(f, self.wfile)
 
     def send_error_json(self, status, message):
         # Don't keep a connection open for a client we just turned away.

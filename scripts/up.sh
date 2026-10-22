@@ -8,6 +8,10 @@
 # (inbox, public). Settings live in <state dir>/{relay,inbox}.env. They are
 # created on the first run, which needs the allowed peers (comma-separated
 # tailnet IPs), and never overwritten, so re-running only updates the code.
+#
+# Short-lived sessions: put SESSION_HOST=<this host's LAN IP> in inbox.env. This
+# then makes a self-signed certificate for that address in <state dir>/session
+# (once), mounts it into the inbox only, and prints the pin for the phone build.
 
 set -euo pipefail
 
@@ -46,13 +50,45 @@ if [ ! -f "$STATE/inbox.env" ]; then
 fi
 chmod 600 "$STATE"/*.env
 
+SESSION_HOST=$(sed -n 's/^SESSION_HOST=//p' "$STATE/inbox.env")
+SESSION_PORT=$(sed -n 's/^SESSION_PORT=//p' "$STATE/inbox.env")
+SESSION_MOUNT=()
+if [ -n "$SESSION_HOST" ]; then
+  mkdir -p "$STATE/session"
+  if [ ! -f "$STATE/session/cert.pem" ]; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+      -keyout "$STATE/session/key.pem" -out "$STATE/session/cert.pem" \
+      -subj "/CN=light-relay sessions" -addext "subjectAltName=IP:$SESSION_HOST" 2>/dev/null
+    chmod 600 "$STATE/session/key.pem"
+    echo "==> made a certificate for $SESSION_HOST in $STATE/session"
+  fi
+  [ "$(id -u)" = 0 ] && chown -R 99:100 "$STATE/session"
+  SESSION_MOUNT=(-v "$STATE/session:/session:ro")
+fi
+
+# Optional: WEBHOOK_URL, WEBHOOK_KEY (and WEBHOOK_AGENT, an agent's tailnet IP
+# whose ack decides re-sends) in <state dir>/webhook.env wake an agent on each reply.
+WEBHOOK_ENV=()
+if [ -f "$STATE/webhook.env" ]; then
+  chmod 600 "$STATE/webhook.env"
+  WEBHOOK_ENV=(--env-file "$STATE/webhook.env")
+fi
+# Optional: named agents (see docs/agents.md). <state dir>/agents.env holds AGENTS
+# and each agent's AGENT_<NAME>_TOKEN / AGENT_<NAME>_IP, for both containers;
+# AGENT_<NAME>_WEBHOOK_URL / _KEY go in webhook.env, which only the inbox reads.
+AGENTS_ENV=()
+if [ -f "$STATE/agents.env" ]; then
+  chmod 600 "$STATE/agents.env"
+  AGENTS_ENV=(--env-file "$STATE/agents.env")
+fi
+
 echo "==> starting containers"
 docker rm -f light-relay light-relay-inbox >/dev/null 2>&1 || true
 docker run -d --name light-relay-inbox --restart unless-stopped --network host "${RUN_AS[@]}" \
-  --env-file "$STATE/inbox.env" -e ROLE=inbox -e HOST=127.0.0.1 -e PORT=18081 \
-  -v "$STATE/inbox:/data" -v "$STATE/relay:/outbox:ro" light-relay:local >/dev/null
+  --env-file "$STATE/inbox.env" "${AGENTS_ENV[@]}" "${WEBHOOK_ENV[@]}" -e ROLE=inbox -e HOST=127.0.0.1 -e PORT=18081 \
+  -v "$STATE/inbox:/data" -v "$STATE/relay:/outbox:ro" "${SESSION_MOUNT[@]}" light-relay:local >/dev/null
 docker run -d --name light-relay --restart unless-stopped --network host "${RUN_AS[@]}" \
-  --env-file "$STATE/relay.env" -e ROLE=relay -e HOST=127.0.0.1 -e PORT=18080 \
+  --env-file "$STATE/relay.env" "${AGENTS_ENV[@]}" -e ROLE=relay -e HOST=127.0.0.1 -e PORT=18080 \
   -v "$STATE/relay:/data" -v "$STATE/inbox:/inbox:ro" light-relay:local >/dev/null
 
 sleep 2
@@ -75,3 +111,9 @@ tailscale funnel --bg --https=8443 http://127.0.0.1:18081 >/dev/null \
 NAME=$(tailscale status --json | grep -m1 '"DNSName"' | sed 's/.*: "\(.*\)\.",*/\1/')
 echo "    relay  https://$NAME              (tailnet only: the agent's RELAY_URL)"
 echo "    inbox  https://$NAME:8443/replies   (public: the tool's relay.inboxUrl)"
+if [ -n "$SESSION_HOST" ]; then
+  PIN=$(openssl x509 -in "$STATE/session/cert.pem" -pubkey -noout | openssl pkey -pubin -outform der \
+    | openssl dgst -sha256 -binary | base64)
+  echo "    sessions https://$SESSION_HOST:${SESSION_PORT:-18443}   (LAN only: the tool's relay.sessionUrl)"
+  echo "    relay.sessionPin=$PIN"
+fi

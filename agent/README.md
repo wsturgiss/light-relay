@@ -19,52 +19,60 @@ reachable. Every message interrupts them.
 - **Detail:** up to 1000 characters. In practice, two or three plain sentences. No
   markdown, no links worth tapping (the phone can't open them), no tables.
 - **Choices:** when you need a decision, offer up to 4, each up to 24 characters. The
-  user can tap one, or type a reply instead.
-
-## Commands
-
-| What | Command |
-|---|---|
-| Start a conversation | `relayctl.py notify "<headline>" "<detail>" [--choice A --choice B]` |
-| Continue one | `relayctl.py notify "<headline>" "<detail>" --thread <message id>` |
-| Unhandled replies | `relayctl.py replies` |
-| Mark replies handled | `relayctl.py ack <seq>` (everything up to and including `seq`) |
-
-`notify` prints `{"id": "m_…", "at": "…", "thread": "m_…", "pushed": true|false}`. Keep the `id`.
-
-## Conversations
-
-Each message either starts a conversation or continues one. On the phone, a
-conversation is one row in the inbox and one screen when the user opens it.
-
-- **Answering a reply? Continue its thread** with `--thread <the reply's messageId>`.
-  Any message id in the conversation works; the relay finds the start.
-- **The user can start a conversation too.** It arrives in `replies` with no
-  `messageId`, a `thread` (`t_…`) and a `title` (their first line). Answer with
-  `--thread <that thread>`, and keep using it for the rest of the conversation.
-- **New subject? Leave `--thread` off.**
-- Don't open a new conversation for a follow-up. It shows up on the phone as an
-  unrelated message.
+  user can tap one, or type a reply instead. Once answered, the phone locks the choices
+  and puts a check on the pick.
+  - `--danger X` instead of `--choice X` for something hard to undo: it is shown inverted
+    and the phone asks "Are you sure?" before sending it.
+  - `--choice ID=X` names the id that comes back in the reply's `choiceIds` (default c1, c2, …).
+  - `--many`: the user picks several, then Done. `--other`: adds "Other…", a typed answer.
+- **You have one conversation on the phone.** Everything you send lands in it, and what
+  the user writes in it comes back to you. There are no threads: just `notify`. (`--thread`
+  is still accepted, and ignored, so older scripts keep working.)
+- **Check `to` on each reply.** It names the agent whose conversation it was written in
+  (the relay's `AGENTS`). Take only the ones addressed to you. With no `to` (an older
+  phone, or `AGENTS` unset), agree with the other agents who takes them.
 
 ## Replies
 
 `relayctl.py replies` returns a JSON list, oldest first:
 
 ```json
-[{ "seq": 8, "id": "r_…", "messageId": "m_356f72d08c65d0ee", "thread": null, "title": null,
+[{ "seq": 8, "id": "r_…", "messageId": "m_356f72d08c65d0ee", "to": "Huginn",
    "choice": "Nice", "text": null, "sentAt": "2026-10-05T04:41:02Z", "receivedAt": "2026-10-05T04:41:02Z" },
- { "seq": 9, "id": "r_…", "messageId": null, "thread": "t_8c1f0a2b3d4e5f60", "title": "Plan Saturday",
-   "choice": null, "text": "Plan Saturday\nHike or the market?", "sentAt": "…", "receivedAt": "…" }]
+ { "seq": 9, "id": "r_…", "messageId": null, "to": "Huginn",
+   "choice": null, "text": "Hike or the market?", "sentAt": "…", "receivedAt": "…" }]
 ```
 
-- `messageId` is the message being answered. Match it to the `id` you kept.
-- No `messageId` but a `thread`: the user started a conversation (see
-  **Conversations**), or added to it before you answered. Once you've answered, their
-  replies carry your message's id as `messageId`, like any other reply.
-- A reply has a tapped `choice` or typed `text`, sometimes both.
+- `to` is whose conversation it was written in.
+- `messageId` is set only on an answer to one of your questions: the question it answers.
+  Match it to the `id` you kept. Typed text, voice notes and photos have none.
+- A reply has a tapped `choice`, typed `text` or `attachments`, sometimes several.
+- Answering a question: `choiceIds` lists the ids tapped and `choice` their labels
+  (joined with ", " for `--many`). An "Other…" answer has `other: true` and the `text`.
+  `answeredAt` is when the question was first answered; `secondAnswer: true` means it
+  had been answered already (another device, or an old app): act on the first.
+
+## Voice notes and photos
+
+A reply's `attachments` lists what the user recorded or photographed:
+`[{"id": "a_…", "type": "audio/ogg", "bytes": 48213}]`. A voice note can be the whole
+reply, with no `text`.
+
+- `relayctl.py attachment <id>` saves it here as `<id>.ogg`, `.jpg` and so on, and prints
+  `{"path", "type", "bytes"}`.
+- **Voice notes:** treat the transcript as the reply's text. The relay usually has one,
+  as `"transcript"` on the attachment, a few seconds after the note arrives. If it's
+  missing, check again shortly, or transcribe the note yourself. If neither works, tell
+  the user you got a voice note you couldn't listen to; don't guess.
+- **Photos:** look at it. Answer about what's in it.
+- Fetch them when the reply arrives. They're kept 30 days, then `attachment` fails with
+  a `404`.
 - **Act first, then `ack`.** Anything not acknowledged comes back next time, so a crash
   between the two can't lose a reply. Don't `ack` past a reply you haven't handled, and
   don't use `replies --ack`, which acknowledges everything it prints.
+- **Other agents may use the same relay.** You see replies to their messages too. Skip
+  any whose `to` isn't you, and `ack` past them freely: your
+  acknowledgements move only your own position, never theirs.
 - A reply can arrive minutes or hours later. Check on a schedule.
 
 ## Things not to do
